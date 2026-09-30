@@ -1,0 +1,48 @@
+# UAP passes over a quiet day, modelled as magnetic dipoles of 1e9 A·m²
+# (200 nT at 1 km on the dipole's axis, 1.6 nT at 5 km, falling as 1/r³).
+# Three geometries repeat every 15 minutes, 5 minutes apart: one well inside
+# the sensor's reach, one near its edge and one beyond it, so a chart shows
+# what "detectable" means at 15 nT noise. The sensor is mounted turned 37°
+# east of north and upside down (+Z up), which the orientation card should
+# work out from the field alone.
+name: uap-flyby
+description: Repeating UAP dipole passes at 0.6, 1.5 and 3 km slant range, sensor mounted rotated
+seed: 7
+start: now
+site:
+  latitude: 34.85
+  longitude: -82.39
+  altitude_m: 300
+field:
+  crustal_offset_nt: [42.0, -18.0, 65.0]
+  diurnal:
+    f107: 120
+sensor:
+  mounting:
+    yaw_deg: 37
+    roll_deg: 180
+events:
+  - type: uap_pass
+    at: +2m
+    every: 15m
+    closest_approach_m: 400
+    altitude_m: 450
+    speed_mps: 120
+    heading_deg: 70
+    moment_am2: 1.0e+9
+  - type: uap_pass
+    at: +7m
+    every: 15m
+    closest_approach_m: 1300
+    altitude_m: 800
+    speed_mps: 80
+    heading_deg: 200
+    moment_am2: 1.0e+9
+  - type: uap_pass
+    at: +12m
+    every: 15m
+    closest_approach_m: 2800
+    altitude_m: 1000
+    speed_mps: 250
+    heading_deg: 330
+    moment_am2: 1.0e+9

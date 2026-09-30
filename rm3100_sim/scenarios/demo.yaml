@@ -1,0 +1,49 @@
+# What `docker compose up` runs: the rotated mounting and UAP passes of
+# uap-flyby, a parked car for half an hour, and a short burst of I2C NACKs
+# every half hour so the health card has something to report.
+name: demo
+description: UAP passes, a parked vehicle, occasional I2C errors, rotated sensor mounting
+seed: 42
+start: now
+site:
+  latitude: 34.85
+  longitude: -82.39
+  altitude_m: 300
+field:
+  crustal_offset_nt: [42.0, -18.0, 65.0]
+  diurnal:
+    f107: 120
+sensor:
+  mounting:
+    yaw_deg: 37
+    roll_deg: 180
+events:
+  - type: uap_pass
+    at: +90s
+    every: 10m
+    closest_approach_m: 450
+    altitude_m: 400
+    speed_mps: 110
+    heading_deg: 70
+    moment_am2: 1.0e+9
+  - type: uap_pass
+    at: +6m
+    every: 10m
+    closest_approach_m: 1400
+    altitude_m: 700
+    speed_mps: 70
+    heading_deg: 210
+    moment_am2: 1.0e+9
+  - type: step
+    # A car parked about 8 m from the sensor.
+    at: +20m
+    every: 2h
+    duration: 30m
+    delta_nt: [35.0, -12.0, 48.0]
+    ramp_s: 20
+faults:
+  - type: nack
+    at: +15m
+    every: 30m
+    duration: 20s
+    probability: 0.4

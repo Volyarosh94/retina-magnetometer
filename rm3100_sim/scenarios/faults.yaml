@@ -1,0 +1,28 @@
+# The failure modes the app's health reporting exists for. Every 20 minutes:
+# a minute of flaky I2C (30 % of transfers NACK), then a sensor that drops off
+# the bus for 30 s and comes back power-cycled (cycle count reset to 200), then
+# 20 s where conversions never raise DRDY.
+name: faults
+description: Recurring I2C NACK bursts, sensor disconnects with power-cycle, and stuck DRDY
+seed: 3
+start: now
+site:
+  latitude: 34.85
+  longitude: -82.39
+  altitude_m: 300
+field:
+  crustal_offset_nt: [42.0, -18.0, 65.0]
+faults:
+  - type: nack
+    at: +1m
+    every: 20m
+    duration: 60s
+    probability: 0.3
+  - type: disconnect
+    at: +4m
+    every: 20m
+    duration: 30s
+  - type: stuck_drdy
+    at: +7m
+    every: 20m
+    duration: 20s
