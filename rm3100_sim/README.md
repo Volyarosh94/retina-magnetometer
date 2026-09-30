@@ -196,4 +196,4 @@ that, and that a different seed changes the noise but not the field.
 `--speed` runs scenario time faster than real time (a day in 24 minutes at
 60) without changing the chip's conversion timing, so the app's driver sees
 hardware timing while the chart shows a day's variation. For history, use
-`backfill`: a week at 1 Hz takes under a minute.
+`backfill`: a week at 1 Hz takes about a minute on a laptop.
