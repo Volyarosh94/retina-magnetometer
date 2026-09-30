@@ -1,0 +1,54 @@
+# The entry to add under `services:` in retina-node/docker-compose.yml.
+#
+# Not a compose file of its own: Mender's docker-compose update module deploys
+# one project per device, so this service has to live in retina-node's. The
+# full procedure, and what has to be true of the node first (I2C enabled in
+# owl-os), is in docs/adding-to-a-retina-node.md. Also add MAGNETOMETER_V to
+# the header's release list, a matching -e clause in
+# scripts/build_mender_artifact.sh, and the port to the README's table.
+
+  retina-magnetometer:
+    restart: always
+    image: ghcr.io/offworldlabs/retina-magnetometer:${MAGNETOMETER_V:-v0.1.0}
+    container_name: retina-magnetometer
+    networks:
+      - blah2
+    ports:
+      # The page and its read-only JSON API. 3030 follows retina-spectrum's
+      # 3020 and collides with nothing on a node.
+      - "${MAGNETOMETER_PORT:-3030}:3030"
+    # No depends_on. The app reads config.yml when it starts and copes with it
+    # being absent, and it should keep recording while the radar side of the
+    # stack restarts around it.
+    environment:
+      - MAGNETOMETER_BUS=/dev/i2c-1
+      - MAGNETOMETER_SAMPLE_RATE_HZ=${MAGNETOMETER_SAMPLE_RATE_HZ:-1}
+      - MAGNETOMETER_CYCLE_COUNT=${MAGNETOMETER_CYCLE_COUNT:-200}
+      - MAGNETOMETER_NODE_CONFIG=/config/config.yml
+      - MAGNETOMETER_LOG_LEVEL=${MAGNETOMETER_LOG_LEVEL:-INFO}
+    volumes:
+      # Database and status.json. Bounded by the app (7 days raw, 1 year of
+      # minute summaries, 1 GB cap by default).
+      - ${DATA_DIR:-/data/retina-node}/retina-magnetometer:/data
+      # The merged config, read-only, for location.rx: the reference point
+      # for the orientation check.
+      - ${CONFIG_DIR:-/data/retina-node/config}:/config:ro
+      # /dev, not `devices: [/dev/i2c-1]`. A `devices:` entry fails `up` on
+      # any node where the bus does not exist yet (I2C is off in owl-os
+      # today), and a failed `up` fails the Mender install of the whole stack.
+      # Binding /dev always succeeds; the cgroup rule below is what limits the
+      # container to I2C adapters, and the app reports a missing bus on its
+      # status page instead of refusing to start.
+      - /dev:/dev
+    device_cgroup_rules:
+      # Character major 89 is i2c-dev: /dev/i2c-* and nothing else.
+      - "c 89:* rmw"
+    # Root inside the container owns /dev/i2c-1 (root:i2c 0660) and the data
+    # directory Docker creates, without needing any capability.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp

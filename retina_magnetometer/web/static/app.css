@@ -1,0 +1,169 @@
+/* The magnetometer page, in the node UI's design language.
+   Tokens are retina-gui's static/common.css (the OWL-OS reskin) so the page
+   sits beside the GUI without looking like a different product; the status
+   colours are the brand guide's owl-os set, and the axis colours its chart
+   palette (blue, emerald, amber for X, Y, Z; violet for |B| rather than the
+   palette's fourth entry, red, which on a status page reads as an error). */
+
+:root {
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+    --bg:        oklch(0.995 0.003 75);
+    --surface:   #ffffff;
+    --surface-2: oklch(0.985 0.003 75);
+    --line:      oklch(0.93 0.005 75);
+    --line-2:    oklch(0.96 0.004 75);
+    --ink:       oklch(0.20 0.012 260);
+    --ink-2:     oklch(0.42 0.012 260);
+    --ink-3:     oklch(0.62 0.010 260);
+    --accent:    oklch(0.62 0.15 250);
+
+    --ok:        #33a868;
+    --ok-soft:   #eaf6ef;
+    --warn:      #e1a035;
+    --warn-soft: #fcf3e3;
+    --warn-ink:  oklch(0.50 0.11 75);
+    --bad:       #e64343;
+    --bad-soft:  #fdecec;
+
+    --axis-x: #3b82f6;
+    --axis-y: #10b981;
+    --axis-z: #f59e0b;
+    --axis-b: #8b5cf6;
+
+    --r-sm: 6px;
+    --r-md: 10px;
+    --r-lg: 14px;
+    --shadow-sm: 0 1px 0 oklch(0.20 0.012 260 / 0.04), 0 1px 2px oklch(0.20 0.012 260 / 0.04);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.muted { color: var(--ink-3); }
+
+.page { min-height: 100vh; display: flex; flex-direction: column; }
+
+/* ── Header ─────────────────────────────────── */
+.nav {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 28px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    position: sticky; top: 0; z-index: 10;
+}
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand-mark { width: 30px; height: 30px; color: var(--ink); }
+.brand-text { display: flex; flex-direction: column; line-height: 1.15; }
+.brand-name { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
+.brand-sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
+.brand-sub .mono { color: var(--ink-2); }
+.nav-spacer { flex: 1; }
+.nav-meta { color: var(--ink-3); font-size: 12.5px; }
+.nav-meta .mono { color: var(--ink-2); }
+
+.pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 4px 11px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 500;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+}
+.pill.small { padding: 2px 9px; font-size: 12px; }
+.pill-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--ink-3); }
+.pill.ok   { background: var(--ok-soft);   border-color: #bfe5cd; color: #1f6d43; }
+.pill.ok .pill-dot   { background: var(--ok); }
+.pill.warn { background: var(--warn-soft); border-color: #f1d9a8; color: var(--warn-ink); }
+.pill.warn .pill-dot { background: var(--warn); }
+.pill.bad  { background: var(--bad-soft);  border-color: #f5c2c2; color: #a52424; }
+.pill.bad .pill-dot  { background: var(--bad); }
+
+/* ── Layout ─────────────────────────────────── */
+.main { width: 100%; max-width: 1280px; margin: 0 auto; padding: 20px 28px 32px; display: flex; flex-direction: column; gap: 16px; }
+
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.tile {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md);
+    padding: 12px 14px; box-shadow: var(--shadow-sm); position: relative; overflow: hidden;
+}
+.tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+.tile-b::before { background: var(--axis-b); }
+.tile-x::before { background: var(--axis-x); }
+.tile-y::before { background: var(--axis-y); }
+.tile-z::before { background: var(--axis-z); }
+.tile-label { font-size: 12px; color: var(--ink-3); font-weight: 500; }
+.tile-value { font-size: 22px; font-weight: 600; margin-top: 2px; }
+.tile-unit { font-size: 11.5px; color: var(--ink-3); }
+
+.card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
+    padding: 16px 18px; box-shadow: var(--shadow-sm);
+}
+.card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.card-head h2 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+.card-head .segmented, .card-head .pill { margin-left: auto; }
+.sub-head { font-size: 12.5px; font-weight: 600; color: var(--ink-2); margin: 14px 0 6px; }
+.detail { color: var(--ink-2); margin: 0 0 10px; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* ── Window selector ────────────────────────── */
+.segmented { display: inline-flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; }
+.seg-btn {
+    border: 0; background: transparent; font: inherit; font-size: 12.5px; font-weight: 500;
+    color: var(--ink-2); padding: 4px 11px; border-radius: 7px; cursor: pointer;
+}
+.seg-btn:hover { color: var(--ink); }
+.seg-btn.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px oklch(0.2 0.012 260 / 0.12); }
+
+.chart-note { color: var(--ink-3); font-size: 12.5px; margin-bottom: 6px; }
+.chart { width: 100%; height: 560px; }
+
+/* ── Facts ──────────────────────────────────── */
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; margin: 0; font-size: 13px; }
+.facts dt { color: var(--ink-3); }
+.facts dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.facts dd.warn { color: var(--warn-ink); }
+.facts dd.bad { color: #a52424; }
+
+.orient { display: grid; grid-template-columns: 200px 1fr; gap: 16px; align-items: center; }
+.compass-figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.compass { width: 200px; height: 200px; }
+.compass-caption { font-size: 11.5px; color: var(--ink-3); text-align: center; }
+.notes { margin: 12px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 12.5px; }
+.notes li + li { margin-top: 4px; }
+
+.errors { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--ink-2); max-height: 150px; overflow: auto; }
+.errors li + li { margin-top: 3px; }
+.errors .when { color: var(--ink-3); font-family: var(--font-mono); font-size: 11.5px; margin-right: 6px; }
+
+.meter { height: 8px; border-radius: 999px; background: var(--line-2); overflow: hidden; margin: 2px 0 12px; }
+.meter-fill { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.meter-fill.warn { background: var(--warn); }
+
+/* ── Footer ─────────────────────────────────── */
+.foot {
+    margin-top: auto; border-top: 1px solid var(--line); padding: 10px 28px;
+    color: var(--ink-3); font-size: 12px; display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
+}
+.foot .mono { color: var(--ink-2); }
+.foot-spacer { flex: 1; }
+
+@media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+    .tiles { grid-template-columns: repeat(2, 1fr); }
+    .orient { grid-template-columns: 1fr; justify-items: center; }
+    .nav { padding: 10px 16px; flex-wrap: wrap; }
+    .main { padding: 16px; }
+    .chart { height: 480px; }
+}

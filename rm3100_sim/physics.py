@@ -21,6 +21,7 @@ noise in every run with the same seed.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import math
 from collections.abc import Sequence
@@ -487,7 +488,13 @@ class Step:
 
 @dataclass
 class FieldModel:
-    """Everything outside the sensor, summed. Pure: no state changes on call."""
+    """Everything outside the sensor, summed. Pure: no state changes on call.
+
+    A week of repeating passes is thousands of dipoles, and a week of 1 Hz
+    samples is 600,000 evaluations, so each pass is only evaluated inside the
+    window where it contributes more than ``NEGLIGIBLE_NT`` — a thousandth of
+    a nanotesla, four orders of magnitude under the sensor's resolution.
+    """
 
     site: Site
     crustal_offset: Vec = (0.0, 0.0, 0.0)
@@ -496,24 +503,38 @@ class FieldModel:
     steps: Sequence[Step] = field(default_factory=tuple)
     passes: Sequence[UapPass] = field(default_factory=tuple)
 
+    NEGLIGIBLE_NT = 1e-3
+
     def __post_init__(self) -> None:
         self._main = MainField(self.site)
+        windows = []
+        for p in self.passes:
+            # Beyond this range even the dipole's axis is below NEGLIGIBLE_NT.
+            reach_m = (MU0_OVER_4PI * TESLA_TO_NT * 2.0 * norm(p.moment) / self.NEGLIGIBLE_NT) ** (1.0 / 3.0)
+            half_s = max(0.0, reach_m**2 - p.closest_approach_m**2 - p.altitude_m**2) ** 0.5 / p.speed_mps
+            windows.append((p.t_cpa - half_s, p.t_cpa + half_s, p))
+        windows.sort(key=lambda w: w[0])
+        self._pass_starts = [w[0] for w in windows]
+        self._pass_windows = windows
+        self._longest_pass_s = max((w[1] - w[0] for w in windows), default=0.0)
 
-    def main_field(self, t: float) -> Vec:
-        return self._main(t)
+    def active_passes(self, t: float) -> list[UapPass]:
+        """The passes close enough at ``t`` to matter."""
+        hi = bisect.bisect_right(self._pass_starts, t)
+        lo = bisect.bisect_left(self._pass_starts, t - self._longest_pass_s)
+        return [w[2] for w in self._pass_windows[lo:hi] if w[1] >= t]
+
+    def uap_field(self, t: float) -> Vec:
+        return add((0.0, 0.0, 0.0), *(p.field(t) for p in self.active_passes(t)))
 
     def disturbance(self, t: float) -> Vec:
         """Everything except the main field and crust: what a detector hunts in."""
-        parts: list[Vec] = [(0.0, 0.0, 0.0)]
+        parts: list[Vec] = [self.uap_field(t)]
         if self.sq is not None:
             parts.append(self.sq(t))
         parts.extend(storm(t) for storm in self.storms)
         parts.extend(step(t) for step in self.steps)
-        parts.extend(p.field(t) for p in self.passes)
         return add(*parts)
-
-    def uap_field(self, t: float) -> Vec:
-        return add((0.0, 0.0, 0.0), *(p.field(t) for p in self.passes))
 
     def __call__(self, t: float) -> Vec:
         return add(self._main(t), self.crustal_offset, self.disturbance(t))

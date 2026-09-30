@@ -61,6 +61,31 @@ _HSHAKE_RESET = 0x1B  # UM16 Table 5-1 (PX4 treats 0x0B as the default; see docs
 _NOISE_SLOTS_PER_S = 10_000
 
 
+def measure_counts(scenario: Scenario, epoch: float, cycle_counts) -> tuple[int, int, int]:
+    """What the chip converts at scenario time ``epoch``, in counts per axis.
+
+    The scenario's field in the sensor frame, plus datasheet noise for each
+    axis's cycle count (scaled by the scenario), clipped to the ±800 µT range,
+    then quantised with the gain for that cycle count. A dead axis reads 0.
+    Shared by the register model and by ``generate``/``backfill``, so a file
+    of simulated samples is exactly what the chip would have produced.
+    """
+    field = scenario.sensor_field(epoch)
+    slot = round(epoch * _NOISE_SLOTS_PER_S)
+    out = []
+    for i in range(3):
+        if scenario.sensor.dead_axis == _AXES[i]:
+            out.append(0)
+            continue
+        cycle_count = cycle_counts[i]
+        sigma = reg.noise_nt(cycle_count) * scenario.sensor.noise_scale
+        value = field[i] + sigma * physics.gauss(scenario.seed, f"noise-{_AXES[i]}", slot)
+        value = max(-physics.SENSOR_RANGE_NT, min(physics.SENSOR_RANGE_NT, value))
+        counts = round(value * reg.gain_lsb_per_ut(cycle_count) / 1000.0)
+        out.append(max(reg.COUNTS_MIN, min(reg.COUNTS_MAX, counts)))
+    return (out[0], out[1], out[2])
+
+
 class SimClock:
     """Real (monotonic) time for the chip's timing, mapped to scenario time.
 
@@ -111,11 +136,6 @@ class RM3100Model:
         self.address = scenario.sensor.address
         self.stats = DeviceStats()
         self._lock = threading.Lock()
-        self._rotation = physics.rotation_ned_from_sensor(
-            scenario.sensor.mounting.yaw_deg,
-            scenario.sensor.mounting.pitch_deg,
-            scenario.sensor.mounting.roll_deg,
-        )
         self._was_disconnected = False
         self._power_on_reset()
 
@@ -193,22 +213,10 @@ class RM3100Model:
                 self._latch(axes, done_at - self._conversion_s(axes) / 2.0, done_at)
 
     def _latch(self, axes: int, sample_time: float, done_at: float) -> None:
-        epoch = self.clock.epoch(sample_time)
-        field = self.scenario.sensor_field(epoch)
-        slot = round(epoch * _NOISE_SLOTS_PER_S)
+        counts = measure_counts(self.scenario, self.clock.epoch(sample_time), self.cycle_counts)
         for i, bit in enumerate(_POLL_BITS):
-            if not axes & bit:
-                continue
-            cycle_count = self.cycle_counts[i]
-            if self.scenario.sensor.dead_axis == _AXES[i]:
-                counts = 0
-            else:
-                sigma = reg.noise_nt(cycle_count) * self.scenario.sensor.noise_scale
-                value = field[i] + sigma * physics.gauss(self.scenario.seed, f"noise-{_AXES[i]}", slot)
-                value = max(-physics.SENSOR_RANGE_NT, min(physics.SENSOR_RANGE_NT, value))
-                counts = round(value * reg.gain_lsb_per_ut(cycle_count) / 1000.0)
-                counts = max(reg.COUNTS_MIN, min(reg.COUNTS_MAX, counts))
-            self.results[3 * i : 3 * i + 3] = reg.encode_int24(counts)
+            if axes & bit:
+                self.results[3 * i : 3 * i + 3] = reg.encode_int24(counts[i])
         self.stats.measurements += 1
         if not self._drdy_stuck(self.clock.epoch(done_at)):
             self.drdy = True

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+    <meta charset="utf-8">
+    <title>Magnetometer · RETINA node</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="{{ url_for('static', filename='app.css', v=version) }}" rel="stylesheet">
+</head>
+<body>
+<div class="page">
+    <header class="nav">
+        <div class="brand">
+            <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+                <circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2"/>
+                <path d="M16 5 L20 16 L16 27 L12 16 Z" fill="currentColor" opacity=".85"/>
+            </svg>
+            <div class="brand-text">
+                <span class="brand-name">RM3100 magnetometer</span>
+                <span class="brand-sub">RETINA node · <span class="mono" id="bus-label">…</span></span>
+            </div>
+        </div>
+        <div class="nav-spacer"></div>
+        <span class="pill" id="state-pill" title=""><span class="pill-dot"></span><span id="state-text">Loading…</span></span>
+        <span class="nav-meta">Last sample <span class="mono" id="last-age">–</span></span>
+    </header>
+
+    <main class="main">
+        <section class="tiles" aria-label="Latest reading">
+            <div class="tile tile-b"><div class="tile-label">|B|</div><div class="tile-value mono" id="tile-b">–</div><div class="tile-unit">nT</div></div>
+            <div class="tile tile-x"><div class="tile-label">X</div><div class="tile-value mono" id="tile-x">–</div><div class="tile-unit">nT</div></div>
+            <div class="tile tile-y"><div class="tile-label">Y</div><div class="tile-value mono" id="tile-y">–</div><div class="tile-unit">nT</div></div>
+            <div class="tile tile-z"><div class="tile-label">Z</div><div class="tile-value mono" id="tile-z">–</div><div class="tile-unit">nT</div></div>
+        </section>
+
+        <section class="card chart-card">
+            <div class="card-head">
+                <h2>Field over time</h2>
+                <div class="segmented" role="tablist" aria-label="Time window" id="windows">
+                    {% for w in windows %}
+                    <button class="seg-btn" data-window="{{ w }}" role="tab">{{ {600: '10 min', 3600: '1 h', 21600: '6 h', 86400: '24 h', 604800: '7 d', 2592000: '30 d'}[w] }}</button>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="chart-note" id="chart-note">Sensor axes, in nanotesla. Drag across the chart to zoom in; double-click to go back.</div>
+            <div id="chart" class="chart" aria-label="Field chart"></div>
+        </section>
+
+        <div class="grid">
+            <section class="card" id="orientation-card">
+                <div class="card-head"><h2>Orientation</h2><span class="pill small" id="orient-verdict"><span class="pill-dot"></span><span>–</span></span></div>
+                <div class="orient">
+                    <figure class="compass-figure">
+                        <svg id="compass" class="compass" viewBox="-110 -110 220 220" role="img" aria-label="Compass: sensor heading relative to north"></svg>
+                        <figcaption id="compass-caption" class="compass-caption"></figcaption>
+                    </figure>
+                    <dl class="facts" id="orient-facts"></dl>
+                </div>
+                <ul class="notes" id="orient-notes"></ul>
+            </section>
+
+            <section class="card" id="health-card">
+                <div class="card-head"><h2>Sensor health</h2></div>
+                <p class="detail" id="health-detail">–</p>
+                <dl class="facts" id="health-facts"></dl>
+                <h3 class="sub-head">Recent errors</h3>
+                <ol class="errors" id="health-errors"><li class="muted">None</li></ol>
+            </section>
+
+            <section class="card" id="storage-card">
+                <div class="card-head"><h2>Storage</h2></div>
+                <div class="meter" aria-label="Database size against its cap"><div class="meter-fill" id="storage-meter"></div></div>
+                <dl class="facts" id="storage-facts"></dl>
+            </section>
+
+            <section class="card" id="config-card">
+                <div class="card-head"><h2>Configuration</h2></div>
+                <p class="detail">Set in the service's environment (<span class="mono">MAGNETOMETER_*</span>); restart the container to apply. See the README for every option.</p>
+                <dl class="facts" id="config-facts"></dl>
+            </section>
+        </div>
+    </main>
+
+    <footer class="foot">
+        <span>retina-magnetometer <span class="mono">{{ version }}</span></span>
+        <span>Reference field <span class="mono">WMM2025</span></span>
+        <span id="foot-location">Location <span class="mono">–</span></span>
+        <div class="foot-spacer"></div>
+        <a href="/api/health">status JSON</a>
+    </footer>
+</div>
+<script src="{{ url_for('static', filename='vendor/plotly-basic-3.7.0.min.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js', v=version) }}"></script>
+</body>
+</html>

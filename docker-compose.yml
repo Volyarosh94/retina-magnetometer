@@ -1,0 +1,51 @@
+# A RETINA magnetometer node with no hardware: the app, driven over TCP by the
+# RM3100 simulator, at http://localhost:3030.
+#
+#   docker compose up --build              # live data from the demo scenario
+#   docker compose run --rm backfill       # optional: add a week of history first
+#   SIM_SCENARIO=faults docker compose up  # any scenario: list with
+#                                          #   docker compose run --rm rm3100-sim rm3100_sim list
+#
+# The app here is configured exactly as on a node except for the bus: a node
+# sets MAGNETOMETER_BUS=/dev/i2c-1 (see deploy/retina-node-service.yml), this
+# file points it at the simulator. No code differs.
+name: retina-magnetometer-demo
+
+services:
+  rm3100-sim:
+    build: .
+    image: retina-magnetometer:dev
+    command: ["rm3100_sim", "serve", "--scenario", "${SIM_SCENARIO:-demo}", "--port", "9100"]
+    restart: unless-stopped
+
+  magnetometer:
+    image: retina-magnetometer:dev
+    depends_on:
+      - rm3100-sim
+    environment:
+      MAGNETOMETER_BUS: tcp://rm3100-sim:9100
+      # A node reads its position from retina-node's config.yml (location.rx);
+      # the demo has no node config, so it says where the simulated site is.
+      MAGNETOMETER_LATITUDE: "34.85"
+      MAGNETOMETER_LONGITUDE: "-82.39"
+      MAGNETOMETER_ALTITUDE_M: "300"
+      MAGNETOMETER_SAMPLE_RATE_HZ: "${MAGNETOMETER_SAMPLE_RATE_HZ:-1}"
+      MAGNETOMETER_CYCLE_COUNT: "${MAGNETOMETER_CYCLE_COUNT:-200}"
+    ports:
+      - "${MAGNETOMETER_PORT:-3030}:3030"
+    volumes:
+      - magnetometer-data:/data
+    restart: unless-stopped
+
+  # One-shot: seven days of simulated history ending now, written straight
+  # into the app's database, so the 7-day view has something to show on a
+  # fresh install. Safe while the app runs.
+  backfill:
+    image: retina-magnetometer:dev
+    profiles: ["tools"]
+    command: ["rm3100_sim", "backfill", "--scenario", "${SIM_SCENARIO:-demo}", "--days", "7", "--data-dir", "/data"]
+    volumes:
+      - magnetometer-data:/data
+
+volumes:
+  magnetometer-data:

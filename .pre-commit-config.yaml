@@ -1,0 +1,28 @@
+# The whole lint gate. `uv run pre-commit run --all-files` locally reproduces
+# CI exactly; tools/check.sh runs it with the tests.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^retina_magnetometer/web/static/vendor/
+      - id: end-of-file-fixer
+        exclude: ^retina_magnetometer/web/static/vendor/
+      - id: check-yaml
+      - id: check-merge-conflict
+      # The vendored Plotly bundle is 1.1 MB on purpose (see its NOTICE.md);
+      # nothing else should come close.
+      - id: check-added-large-files
+        args: ["--maxkb=1200"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff
+      - id: ruff-format
+
+  - repo: https://github.com/offworldlabs/ops
+    rev: hooks-v1.0
+    hooks:
+      - id: dead-code
+      - id: ruff-config

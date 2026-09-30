@@ -83,3 +83,17 @@ class TestInt24:
     def test_encode_rejects_overflow(self):
         with pytest.raises(ValueError):
             reg.encode_int24(reg.COUNTS_MAX + 1)
+
+
+class TestRegisterMap:
+    def test_cycle_count_registers_are_consecutive_words(self):
+        # One six-byte write from CCX must land on all three (UM16 p.30).
+        assert (reg.CCY - reg.CCX, reg.CCZ - reg.CCY) == (2, 2)
+
+    def test_result_registers_are_consecutive_triplets(self):
+        # One nine-byte read from MX must return X, Y then Z (UM16 p.34).
+        assert (reg.MY - reg.MX, reg.MZ - reg.MY) == (3, 3)
+        assert reg.MZ + 3 - reg.MX == reg.MEASUREMENT_BYTES
+
+    def test_cmm_continuous_value_is_pnis_0x79(self):
+        assert reg.CMM_CONTINUOUS_XYZ == 0x79
