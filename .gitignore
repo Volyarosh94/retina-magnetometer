@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local runtime data (the app writes its database and status file here)
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
