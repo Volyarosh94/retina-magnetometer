@@ -27,6 +27,11 @@ RECENT_MAX_SAMPLES = 200_000
 ROLLUP_EVERY_S = 30.0
 PRUNE_EVERY_S = 600.0
 STATUS_EVERY_S = 5.0
+# The storage figures on the page. Counted from the database rather than kept
+# in step with this process's writes, so a second writer shows up too (the
+# simulator's backfill, run beside the app). A count scans the table, a few
+# tens of milliseconds at a week of 1 Hz, so once a minute, not every status.
+STATS_EVERY_S = 60.0
 
 
 class Recorder:
@@ -41,7 +46,7 @@ class Recorder:
         self._pending: list[tuple[int, float, float, float]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last = {"flush": 0.0, "rollup": 0.0, "prune": 0.0, "status": 0.0}
+        self._last = {"flush": 0.0, "rollup": 0.0, "prune": 0.0, "stats": 0.0, "status": 0.0}
 
     # ── Intake (sampler thread) ──────────────────────────────────────────────
 
@@ -93,11 +98,12 @@ class Recorder:
             removed = self._guarded("prune", self.storage.prune)
             if removed and removed.get("size_capped"):
                 log.warning("database reached its size cap; oldest data removed: %s", removed)
+            self._last["stats"] = 0.0  # what the prune removed shows at once
+        if now - self._last["stats"] >= STATS_EVERY_S:
+            self._last["stats"] = now
             self._refresh_stats()
         if now - self._last["status"] >= STATUS_EVERY_S:
             self._last["status"] = now
-            if self.health.storage is None:
-                self._refresh_stats()
             self._write_status()
 
     def flush(self) -> None:

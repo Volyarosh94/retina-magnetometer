@@ -5,7 +5,7 @@ import sqlite3
 
 from retina_magnetometer.config import from_env
 from retina_magnetometer.health import Health
-from retina_magnetometer.recorder import PRUNE_EVERY_S, ROLLUP_EVERY_S, Recorder
+from retina_magnetometer.recorder import PRUNE_EVERY_S, ROLLUP_EVERY_S, STATS_EVERY_S, Recorder
 from retina_magnetometer.storage import Storage
 
 T0 = 1_790_726_400.0
@@ -60,6 +60,24 @@ def test_rollup_and_prune_run_on_their_own_cadence(tmp_path):
     clock.now += PRUNE_EVERY_S + 1
     recorder.tick()
     assert health.storage["samples"] == 180  # stats refreshed after the prune
+
+
+def test_storage_figures_follow_another_writer(tmp_path):
+    # The simulator's backfill writes into the same database while the app
+    # runs; the page must show what is there within a minute, not at the next
+    # prune.
+    recorder, storage, health, clock = rig(tmp_path)
+    recorder.tick()
+    assert health.storage["samples"] == 0
+    other = Storage(storage.path, raw_retention_days=7, rollup_retention_days=365, max_db_mb=64, clock=clock)
+    other.write_samples([(int((T0 - 3600 + i) * 1000), 1.0, 2.0, 3.0) for i in range(3600)])
+    clock.now += STATS_EVERY_S - 1
+    recorder.tick()
+    assert health.storage["samples"] == 0
+    clock.now += 2
+    recorder.tick()
+    assert health.storage["samples"] == 3600
+    assert health.storage["oldest_sample_ms"] == int((T0 - 3600) * 1000)
 
 
 def test_status_file_follows_health(tmp_path):

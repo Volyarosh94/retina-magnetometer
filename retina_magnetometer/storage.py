@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS meta (
 MINUTE_MS = 60_000
 
 
+_SAMPLE_STATS = ("SELECT COUNT(*) FROM samples", "SELECT MIN(t_ms) FROM samples", "SELECT MAX(t_ms) FROM samples")
+_MINUTE_STATS = ("SELECT COUNT(*) FROM minutes", "SELECT MIN(t_ms) FROM minutes", "SELECT MAX(t_ms) FROM minutes")
+
+
 class Storage:
     """One database file. Safe to share between threads: every call opens its
     own short-lived connection except the writer's, which is serialised."""
@@ -227,8 +231,10 @@ class Storage:
     def stats(self) -> dict:
         db = self._connect()
         try:
-            samples = db.execute("SELECT COUNT(*), MIN(t_ms), MAX(t_ms) FROM samples").fetchone()
-            minutes = db.execute("SELECT COUNT(*), MIN(t_ms), MAX(t_ms) FROM minutes").fetchone()
+            # One aggregate per query: SQLite answers a lone MIN or MAX of the
+            # key from the index, but MIN and MAX together scan the table.
+            samples = [db.execute(query).fetchone()[0] for query in _SAMPLE_STATS]
+            minutes = [db.execute(query).fetchone()[0] for query in _MINUTE_STATS]
         finally:
             db.close()
         return {
