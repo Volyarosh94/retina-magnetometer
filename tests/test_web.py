@@ -205,6 +205,38 @@ def test_series_since_returns_what_a_client_lacks(rig):
         assert tail[axis]["mean"] == full[axis]["mean"][-1:]
 
 
+@pytest.mark.parametrize(
+    "query,source",
+    [
+        ("window=600&points=100", "memory"),
+        ("window=3600&points=1800", "samples+memory"),
+        (f"start={int((NOW - 3000) * 1000)}&end={int((NOW - 1200) * 1000)}&points=100", "samples"),
+        ("window=86400&points=1000", "minutes"),
+    ],
+)
+def test_series_since_is_the_tail_of_the_whole_answer_from_every_source(rig, query, source):
+    # Worked out only from the bucket ``since`` is in, wherever the series
+    # comes from, the answer is exactly the end of the full one.
+    client, recorder, storage, _ = rig
+    older = [
+        (int((NOW - 3600 + i) * 1000), 22_400.0 + 30 * math.sin(i / 90), -2_760.0 + i % 7, 43_000.0)
+        for i in range(3000)
+    ]
+    storage.write_samples(older)
+    storage.rollup(now_ms=int((NOW - 600) * 1000))
+    full = client.get(f"/api/series?{query}").get_json()
+    assert full["source"] == source and len(full["t"]) > 4
+    middle = full["t"][len(full["t"]) // 2]
+    for since in (full["t"][-1], middle, middle + 1, full["start"] - 1):
+        tail = client.get(f"/api/series?{query}&since={since}").get_json()
+        first = next(i for i, t in enumerate(full["t"]) if t >= since)
+        assert tail["since"] == since and tail["source"] == source and tail["bucket_ms"] == full["bucket_ms"]
+        assert tail["t"] == full["t"][first:] and tail["n"] == full["n"][first:]
+        for axis in ("x", "y", "z", "b"):
+            for part in ("min", "mean", "max"):
+                assert tail[axis][part] == full[axis][part][first:]
+
+
 def test_large_responses_are_gzipped_for_clients_that_accept_it(rig):
     client, *_ = rig
     plain = client.get("/api/series?window=600&points=2000")
@@ -492,6 +524,7 @@ def test_page_long_windows_scale_to_the_daily_variation():
         const short = plotly.calls[plotly.calls.length - 1];
         report.tenMinutes = short.layout.yaxis;
         report.tenMinutesNote = el("chart-note").textContent;
+        report.tenMinutesBand = short.data.filter((trace) => trace.yaxis === "y").map((trace) => trace.y);
         """
     )
     low, high = report["week"]["range"]
@@ -500,8 +533,37 @@ def test_page_long_windows_scale_to_the_daily_variation():
     assert "the band runs off them" in report["note"]
     assert "%{customdata[0]" in report["hover"] and report["customdata"][1] - report["customdata"][0] > 1000
     # Ten minutes is about the event, not the day: the band sets the scale.
-    assert report["tenMinutes"]["autorange"] is True and "range" not in report["tenMinutes"]
+    # This one hardly moves (no pass in it), so the scale is the narrowest,
+    # 10 nT, around all of it.
+    low, high = report["tenMinutes"]["range"]
+    assert report["tenMinutes"]["autorange"] is False and high - low == pytest.approx(10)
+    drawn = [v for trace in report["tenMinutesBand"] for v in trace if v is not None]
+    assert low < min(drawn) and max(drawn) < high
     assert "runs off" not in report["tenMinutesNote"]
+
+
+@needs_node
+def test_page_widens_a_scale_too_narrow_for_whole_nanotesla_ticks():
+    # A still sensor: the samples barely move, and a scale fitted to them
+    # would have ticks a fraction of a nanotesla apart, labelled the same.
+    report = run_page(
+        """
+        route = (url) => (url.startsWith("/api/series") ? { status: 200, body: answer(url, { bucket_ms: 6000, value: () => 22397.3 }) } : pending);
+        load("#window=600");
+        await settle();
+        report.still = plotly.calls[plotly.calls.length - 1].layout.yaxis;
+        report.stillNote = el("chart-note").textContent;
+        const swing = (t) => 22397.3 + 20 * Math.sin(t / 60000);
+        route = (url) => (url.startsWith("/api/series") ? { status: 200, body: answer(url, { bucket_ms: 6000, value: swing }) } : pending);
+        await (async () => { for (const b of buttons) if (b.dataset.window === "3600") b.listeners.click(); })();
+        await settle();
+        report.moving = plotly.calls[plotly.calls.length - 1].layout.yaxis;
+        """
+    )
+    assert report["still"]["autorange"] is False
+    assert report["still"]["range"] == pytest.approx([22_392.3, 22_402.3])
+    assert "runs off" not in report["stillNote"]
+    assert report["moving"]["autorange"] is True and "range" not in report["moving"]
 
 
 @needs_node
@@ -570,6 +632,68 @@ def test_page_orientation_without_a_heading():
     assert ["Heading", "none (see below)", "warn"] in report["facts"]
     assert not any("null" in row[0] or "null" in row[1] for row in report["facts"])
     assert "no heading" in report["compass"]
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "true_deg,magnetic_deg,text",
+    [
+        (359.97, 6.99, "0.0° true (7.0° magnetic) ± 0.4°"),
+        (359.94, 6.96, "359.9° true (7.0° magnetic) ± 0.4°"),
+        (0.04, 359.96, "0.0° true (0.0° magnetic) ± 0.4°"),
+        (180.05, 187.08, "180.1° true (187.1° magnetic) ± 0.4°"),
+    ],
+)
+def test_page_heading_rounds_to_a_bearing(true_deg, magnetic_deg, text):
+    # Rounded to a tenth, a heading a hair west of north would read 360.0°.
+    report = run_page(
+        f"""
+        const o = {{
+            verdict: "good", measured: {{ total: 48560 }}, samples: 60, magnitude_ratio: 1.0,
+            reference: {{ total: 48564, inclination_deg: 62.3, declination_deg: -7.0 }},
+            down_axis: "+Z", up_axis: "-Z", tilt_min_deg: 0.1, heading_axis: "+X", heading_true_deg: {true_deg},
+            heading_magnetic_deg: {magnetic_deg}, heading_sigma_deg: 0.36, notes: [], location: null,
+        }};
+        route = (url) => (url === "/api/orientation" ? {{ status: 200, body: o }} : pending);
+        load("#window=600");
+        await settle();
+        report.facts = factsOf("orient-facts");
+        """
+    )
+    assert ["+X heading", text, ""] in report["facts"]
+
+
+@needs_node
+def test_page_gives_rates_the_app_worked_out_to_three_figures():
+    # Poll mode clamps a rate it cannot keep to its ceiling, a figure worked
+    # out to the last bit; the settings' own warning gives it as 87.3 Hz.
+    report = run_page(
+        """
+        const config = {
+            config: {
+                bus: "/dev/i2c-1", i2c_framing: "repeated start", i2c_address: "auto (0x20-0x23)", mode: "poll",
+                sample_rate_hz: 87.2580171575439, cycle_count: 200, self_test: true, raw_retention_days: 7,
+                rollup_retention_days: 365, max_db_mb: 1024, flush_interval_s: 5, data_dir: "/data",
+                node_config: "/config/config.yml", errors: [], warnings: [],
+            },
+            location: null,
+        };
+        const health = {
+            state: "ok", state_text: "Sampling", detail: "", bus: "b", last_sample: null, self_test: null, mode: "poll",
+            configured_rate_hz: 100, effective_rate_hz: 87.2580171575439, measured_rate_hz: 87.19364182510025,
+            last_sample_at: null, samples_total: 10, read_errors_total: 0, consecutive_errors: 0,
+            internal_errors_total: 0, reinitialisations: 0, uptime_s: 3, recent_errors: [], storage: null,
+            storage_error: null, config_warnings: [], config_notes: [],
+        };
+        route = (url) => (url === "/api/config" ? { status: 200, body: config } : url === "/api/health" ? { status: 200, body: health } : pending);
+        load("#window=600");
+        await settle();
+        report.config = factsOf("config-facts");
+        report.health = factsOf("health-facts");
+        """
+    )
+    assert ["Sampling", "poll, 87.3 Hz, 200 cycles", ""] in report["config"]
+    assert ["Mode", "poll; 100 Hz configured · 87.3 Hz effective · 87.2 Hz measured", ""] in report["health"]
 
 
 def test_series_with_an_empty_buffer_comes_from_disk(rig, tmp_path):

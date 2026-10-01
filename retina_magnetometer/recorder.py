@@ -41,6 +41,12 @@ STATUS_EVERY_S = 5.0
 STATS_EVERY_S = 60.0
 # The status file's name among the storage operations that can fail.
 STATUS = "status.json"
+# A task that failed is tried again sooner than its cadence: after 5 s, then
+# 10, 20, 40, and every minute after that (never later than its cadence would
+# run it). A prune that meets a busy database is not reported for the ten
+# minutes until the next one.
+RETRY_FIRST_S = 5.0
+RETRY_MAX_S = 60.0
 
 
 class Recorder:
@@ -60,6 +66,9 @@ class Recorder:
         self._thread: threading.Thread | None = None
         # Never run, so the first tick runs everything.
         self._last = dict.fromkeys(("flush", "rollup", "prune", "stats", "status"), -math.inf)
+        # Tasks whose last run failed: when to try again, and the wait after
+        # that one.
+        self._retry: dict[str, tuple[float, float]] = {}
         # Each storage operation failing now, and how. The storage problem on
         # the page is all of them together, and it clears only when the last
         # one works again: a roll-up that keeps failing is not cleared by every
@@ -159,66 +168,86 @@ class Recorder:
 
     def tick(self) -> None:
         now = self._monotonic()
-        if now - self._last["flush"] >= self.config.flush_interval_s:
-            self._last["flush"] = now
-            self.flush()
-        if now - self._last["rollup"] >= ROLLUP_EVERY_S:
-            self._last["rollup"] = now
-            # Only as far as what is on disk: with a long flush interval the
-            # samples of a minute that ended a while ago may still be pending.
-            self._guarded("rollup", self.storage.rollup, pending_from_ms=self.pending_from_ms())
-        if now - self._last["prune"] >= PRUNE_EVERY_S:
-            self._last["prune"] = now
-            removed = self._guarded("prune", self.storage.prune)
-            if removed and removed.get("size_capped"):
-                log.warning("database reached its size cap; oldest data removed: %s", removed)
+        self._task("flush", self.config.flush_interval_s, now, self.flush)
+        # Only as far as what is on disk: with a long flush interval the
+        # samples of a minute that ended a while ago may still be pending.
+        self._task("rollup", ROLLUP_EVERY_S, now, self._rollup)
+        if self._task("prune", PRUNE_EVERY_S, now, self._prune):
             self._last["stats"] = -math.inf  # what the prune removed shows at once
-        if now - self._last["stats"] >= STATS_EVERY_S:
-            self._last["stats"] = now
-            self._refresh_stats()
-        if now - self._last["status"] >= STATUS_EVERY_S:
-            self._last["status"] = now
-            self._write_status()
+        self._task("stats", STATS_EVERY_S, now, self._refresh_stats)
+        self._task("status", STATUS_EVERY_S, now, self._write_status)
 
-    def flush(self) -> None:
+    def _task(self, name: str, cadence: float, now: float, run) -> bool:
+        """Run a housekeeping task if it is due: on its cadence, or sooner
+        after a failure, on a backoff of its own. Whether it ran."""
+        retry = self._retry.get(name)
+        if now - self._last[name] < cadence and (retry is None or now < retry[0]):
+            return False
+        self._last[name] = now
+        if run():
+            self._retry.pop(name, None)
+        else:
+            wait = min(cadence, RETRY_MAX_S, retry[1] * 2 if retry else RETRY_FIRST_S)
+            self._retry[name] = (now + wait, wait)
+        return True
+
+    def _rollup(self) -> bool:
+        return self._guarded("rollup", self.storage.rollup, pending_from_ms=self.pending_from_ms())[0]
+
+    def _prune(self) -> bool:
+        ok, removed = self._guarded("prune", self.storage.prune)
+        if removed and removed.get("size_capped"):
+            log.warning("database reached its size cap; oldest data removed: %s", removed)
+        # A cap that a reader made wait is tried again soon, as a failure is.
+        return ok and not removed.get("deferred")
+
+    def flush(self) -> bool:
+        """Write what is pending: the session records, then the samples, each
+        an operation of its own, so that neither holds the other up. Whatever
+        fails is kept for the next attempt. Whether it all got through."""
         with self._lock:
             rows, self._pending = self._pending, []
             sessions, self._sessions = self._sessions, []
             self._pending_from = None
-        if not rows and not sessions:
-            return
-        try:
-            self.storage.write_samples(rows, sessions=sessions)
-        except Exception as exc:
-            # Keep them for the next attempt rather than drop them, whatever
-            # went wrong; the buffer is bounded so a dead disk cannot grow
-            # memory without limit.
-            with self._lock:
-                kept = rows + self._pending
-                dropped = max(0, len(kept) - RECENT_MAX_SAMPLES)
-                self._pending = kept[dropped:]
-                self._sessions = sessions + self._sessions
-                self._pending_from = min((r[0] for r in self._pending), default=None)
-            self._failed("write", exc)
-            if dropped and "dropped" not in self._noted:
-                self._noted["dropped"] = "dropping"
-                log.error(
-                    "%d samples wait to be written, the most kept: the oldest are being dropped", RECENT_MAX_SAMPLES
-                )
-        else:
-            self._noted.pop("dropped", None)
-            self._succeeded("write")
+        ok = True
+        if sessions:
+            written, _ = self._guarded("session", self.storage.write_samples, [], sessions=sessions)
+            if not written:
+                with self._lock:
+                    self._sessions = sessions + self._sessions
+                ok = False
+        if rows:
+            written, _ = self._guarded("write", self.storage.write_samples, rows)
+            if written:
+                self._noted.pop("dropped", None)
+            else:
+                # The buffer is bounded so a dead disk cannot grow memory
+                # without limit.
+                with self._lock:
+                    kept = rows + self._pending
+                    dropped = max(0, len(kept) - RECENT_MAX_SAMPLES)
+                    self._pending = kept[dropped:]
+                    self._pending_from = min((r[0] for r in self._pending), default=None)
+                if dropped and "dropped" not in self._noted:
+                    self._noted["dropped"] = "dropping"
+                    log.error(
+                        "%d samples wait to be written, the most kept: the oldest are being dropped",
+                        RECENT_MAX_SAMPLES,
+                    )
+                ok = False
+        return ok
 
-    def _guarded(self, what: str, fn, *args, **kwargs):
-        # Each task fails on its own: one that keeps failing must not hold up
-        # the ones after it in a tick, the status file above all.
+    def _guarded(self, what: str, fn, *args, **kwargs) -> tuple[bool, object]:
+        """(Whether it worked, what it returned.) Each operation fails on its
+        own: one that keeps failing must not hold up the ones after it in a
+        tick, the status file above all."""
         try:
             result = fn(*args, **kwargs)
         except Exception as exc:
             self._failed(what, exc)
-            return None
+            return False, None
         self._succeeded(what)
-        return result
+        return True, result
 
     def _failed(self, what: str, exc: Exception) -> None:
         # A database that cannot be opened is one problem, whichever call
@@ -243,22 +272,24 @@ class Recorder:
             self._report()
 
     def _report(self, stats: dict | None = None) -> None:
-        self.health.storage_update(stats, "; ".join(self._failing.values()) or None)
+        self.health.storage_status(stats, dict(self._failing))
 
-    def _refresh_stats(self) -> None:
-        stats = self._guarded("stats", self.storage.stats)
-        if stats is not None:
+    def _refresh_stats(self) -> bool:
+        ok, stats = self._guarded("stats", self.storage.stats)
+        if ok:
             self._report(stats)
+        return ok
 
-    def _write_status(self) -> None:
+    def _write_status(self) -> bool:
         recovering = STATUS in self._failing
         try:
             write_status_file(self.config.status_path, self.health.snapshot())
         except Exception as exc:
             self._failed(STATUS, exc)
-            return
+            return False
         self._succeeded(STATUS)
         if recovering:
             # That one was written while its own failure still stood; this one
             # says it is over.
-            self._write_status()
+            return self._write_status()
+        return True

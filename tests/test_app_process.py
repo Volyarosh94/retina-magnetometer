@@ -98,6 +98,8 @@ def test_app_samples_the_simulator_and_stops_cleanly(simulator, tmp_path):
         output = process.communicate(timeout=15)[0].decode()
     assert process.returncode == 0, output
     assert "stopped" in output
+    # And closed the database: whole in its one file, the WAL taken into it.
+    assert not (tmp_path / "magnetometer.sqlite-wal").exists()
     # Shutdown flushed the buffer that the 60 s interval was still holding.
     import sqlite3
 

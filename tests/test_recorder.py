@@ -284,11 +284,12 @@ def test_a_flush_that_fails_unexpectedly_keeps_its_samples(tmp_path, monkeypatch
 
     monkeypatch.setattr(storage, "write_samples", bug)
     with caplog.at_level(logging.ERROR, logger="retina_magnetometer.recorder"):
-        recorder.flush()
-    assert health.snapshot()["storage_error"] == "write failed: KeyError: 'gain'"
+        assert recorder.flush() is False
+    # The session record and the samples are written apart, and both failed.
+    assert health.snapshot()["storage_error"] == "session failed: KeyError: 'gain'; write failed: KeyError: 'gain'"
     assert caplog.records[0].exc_info is not None  # a bug: logged with where it happened
     monkeypatch.undo()
-    recorder.flush()
+    assert recorder.flush() is True
     assert storage.stats()["samples"] == 1 and len(storage.sessions()) == 1
 
 
@@ -422,3 +423,113 @@ def test_every_failing_operation_is_reported_until_each_works(tmp_path, monkeypa
     clock.now += STATS_EVERY_S
     recorder.tick()
     assert health.snapshot()["storage_error"] is None
+
+
+def test_a_session_record_that_cannot_be_written_holds_up_no_sample(tmp_path, monkeypatch):
+    # The session is an operation of its own: a failure to record it is
+    # reported as such, the samples are written all the same, and the record
+    # waits for the next flush, stamped when sampling started.
+    recorder, storage, health, clock = rig(tmp_path)
+    recorder.start_session(**SESSION)
+    recorder.add(int(T0 * 1000), 1.0, 2.0, 3.0)
+    write = storage.write_samples
+
+    def sessions_broken(rows, sessions=()):
+        if sessions:
+            raise sqlite3.OperationalError("database or disk is full")
+        write(rows)
+
+    monkeypatch.setattr(storage, "write_samples", sessions_broken)
+    recorder.flush()
+    assert storage.stats()["samples"] == 1 and storage.sessions() == []
+    assert health.snapshot()["storage_error"] == "session failed: database or disk is full"
+    monkeypatch.undo()
+    clock.now += 60
+    recorder.flush()
+    (row,) = storage.sessions()
+    assert row["started_ms"] == int(T0 * 1000) and health.snapshot()["storage_error"] is None
+
+
+def test_operations_failing_and_recovering_in_turn_are_listed_once_each(tmp_path, monkeypatch):
+    # The page's storage problem is all the failing operations together, but
+    # the recent errors list an operation when it starts failing, not every
+    # time the set changes: that once pushed the read errors out of the list.
+    recorder, storage, health, clock = rig(tmp_path)
+    failing = {}
+
+    def maybe(name, real):
+        def call(*args, **kwargs):
+            if name in failing:
+                raise sqlite3.OperationalError(failing[name])
+            return real(*args, **kwargs)
+
+        return call
+
+    for name in ("write_samples", "rollup", "prune", "stats"):
+        monkeypatch.setattr(storage, name, maybe(name, getattr(storage, name)))
+    seen = []
+    script = [
+        {"write_samples": "database is locked"},
+        {"write_samples": "database is locked", "rollup": "database is locked"},
+        {"rollup": "database is locked"},
+        {"rollup": "database is locked", "stats": "disk I/O error"},
+        {"stats": "disk I/O error"},
+        {},
+        {"write_samples": "database is locked"},  # back within a quarter of an hour: not new
+        {},
+    ]
+    for step in script:
+        failing.clear()
+        failing.update(step)
+        for _ in range(4):  # a minute: every task runs, retries included
+            recorder.add(int(clock.now * 1000), 1.0, 2.0, 3.0)
+            recorder.tick()
+            clock.now += 15
+        seen.append(health.snapshot()["storage_error"])
+    assert seen == [
+        "write failed: database is locked",
+        "write failed: database is locked; rollup failed: database is locked",
+        "rollup failed: database is locked",
+        "rollup failed: database is locked; stats failed: disk I/O error",
+        "stats failed: disk I/O error",
+        None,
+        "write failed: database is locked",
+        None,
+    ]
+    listed = [e["message"] for e in health.snapshot()["recent_errors"] if e["kind"] == "storage"]
+    assert listed == [
+        "write failed: database is locked",
+        "rollup failed: database is locked",
+        "stats failed: disk I/O error",
+    ]
+
+
+def test_a_failed_operation_is_tried_again_soon_not_at_its_next_turn(tmp_path, monkeypatch):
+    # One "database is locked" during a backfill used to keep the node
+    # degraded until the next prune, ten minutes on. A failed operation is
+    # tried again after 5 s, then 10, 20, 40, and each minute after that.
+    recorder, storage, health, clock = rig(tmp_path)
+    recorder.tick()  # everything runs once and works
+    clock.now += PRUNE_EVERY_S
+    attempts = []
+    prune = storage.prune
+
+    def locked(*args, **kwargs):
+        attempts.append(clock.now)
+        if len(attempts) <= 6:
+            raise sqlite3.OperationalError("database is locked")
+        return prune(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "prune", locked)
+    first = clock.now
+    while len(attempts) < 7:
+        recorder.tick()
+        clock.now += 0.5
+    assert [round(t - first) for t in attempts] == [0, 5, 15, 35, 75, 135, 195]
+    assert health.snapshot()["storage_error"] is None
+    # Working again, it is back on its cadence.
+    last = attempts[-1]
+    while clock.now < last + PRUNE_EVERY_S + 1:
+        recorder.tick()
+        clock.now += 0.5
+    assert [round(t - last) for t in attempts[7:]] == [600]

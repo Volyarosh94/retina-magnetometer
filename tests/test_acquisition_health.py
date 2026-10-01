@@ -47,7 +47,7 @@ def test_a_storage_failure_is_not_ok():
     # state/detail/errors (retina-telemetry's contract) must be able to tell.
     h, clock = make()
     sampling(h, clock)
-    h.storage_update(None, "write failed: database or disk is full")
+    h.storage_status(None, {"write": "write failed: database or disk is full"})
     snap = h.snapshot()
     assert snap["state"] == "degraded" and snap["state_text"] == "Sampling with errors"
     assert snap["detail"] == "Storage: write failed: database or disk is full"
@@ -60,27 +60,28 @@ def test_a_storage_failure_is_not_ok():
 def test_storage_recovering_clears_the_state():
     h, clock = make()
     sampling(h, clock)
-    h.storage_update(None, "write failed: disk I/O error")
-    h.storage_update(None, None)
+    h.storage_status(None, {"write": "write failed: disk I/O error"})
+    h.storage_status(None, {})
     snap = h.snapshot()
     assert snap["state"] == "ok" and snap["detail"] == "Sampling normally" and snap["storage_error"] is None
 
 
 def test_a_storage_problem_is_listed_once_while_it_keeps_coming_back():
-    # The recorder clears the storage error whenever a write gets through, so
-    # a roll-up that keeps failing comes back every half minute: one problem,
-    # listed once, not twenty "storage" entries pushing the read errors out.
+    # A roll-up that fails and works in turn (a database another writer keeps
+    # busy) is one problem, listed once, not twenty "storage" entries pushing
+    # the read errors out; so is a write that fails at every flush.
     h, clock = make()
     sampling(h, clock)
     for _ in range(5):  # every flush while the card is full
-        h.storage_update(None, "write failed: database or disk is full")
-    h.storage_update({"bytes": 1}, h.storage_error)  # the stats refresh keeps it
-    for _ in range(40):  # 20 minutes of a failing roll-up between good writes
-        h.storage_update(None, "rollup failed: database disk image is malformed")
+        h.storage_status(None, {"write": "write failed: database or disk is full"})
+    h.storage_status({"bytes": 1}, {"write": "write failed: database or disk is full"})  # with new figures
+    h.storage_status(None, {})
+    for _ in range(40):  # 20 minutes of a roll-up failing and working in turn
+        h.storage_status(None, {"rollup": "rollup failed: database disk image is malformed"})
         clock.now += 5
-        h.storage_update(None, None)
+        h.storage_status(None, {})
         clock.now += 25
-    h.storage_update(None, "write failed: database or disk is full")  # twenty minutes after its last report
+    h.storage_status(None, {"write": "write failed: database or disk is full"})  # twenty minutes after its last report
     storage = [e["message"] for e in h.snapshot()["recent_errors"] if e["kind"] == "storage"]
     assert storage == [
         "write failed: database or disk is full",
@@ -93,19 +94,46 @@ def test_a_storage_problem_is_listed_once_while_it_keeps_coming_back():
 def test_a_storage_problem_back_soon_after_it_cleared_is_not_listed_again():
     h, clock = make()
     sampling(h, clock)
-    h.storage_update(None, "prune failed: database is locked")
+    h.storage_status(None, {"prune": "prune failed: database is locked"})
     clock.now += 600  # the next prune, ten minutes on, fails the same way
-    h.storage_update(None, None)
-    h.storage_update(None, "prune failed: database is locked")
+    h.storage_status(None, {})
+    h.storage_status(None, {"prune": "prune failed: database is locked"})
     storage = [e for e in h.snapshot()["recent_errors"] if e["kind"] == "storage"]
     assert len(storage) == 1
+
+
+def test_storage_problems_of_several_operations_show_together():
+    # The recorder reports every operation failing at the time. Each is
+    # listed when it starts; the problem shown is all of them, and lasts
+    # until the last one works again.
+    h, clock = make()
+    sampling(h, clock)
+    write, rollup = "write failed: disk I/O error", "rollup failed: database is locked"
+    h.storage_status(None, {"write": write})
+    h.storage_status(None, {"write": write, "rollup": rollup})
+    snap = h.snapshot()
+    assert snap["storage_error"] == f"{write}; {rollup}"
+    assert snap["detail"] == f"Storage: {write}; {rollup}"
+    h.storage_status(None, {"rollup": rollup})  # the write works again
+    snap = h.snapshot()
+    assert snap["state"] == "degraded" and snap["storage_error"] == rollup
+    h.storage_status(None, {})
+    snap = h.snapshot()
+    assert snap["state"] == "ok" and snap["storage_error"] is None
+    assert [e["message"] for e in snap["recent_errors"] if e["kind"] == "storage"] == [write, rollup]
+    # Failing again soon, the same way, is the same problem; another way, a
+    # new one.
+    h.storage_status(None, {"write": write})
+    h.storage_status(None, {"write": "write failed: database or disk is full"})
+    listed = [e["message"] for e in h.snapshot()["recent_errors"] if e["kind"] == "storage"]
+    assert listed == [write, rollup, "write failed: database or disk is full"]
 
 
 def test_a_storage_problem_adds_to_a_sensor_problem():
     h, clock = make()
     h.self_test_result(passed=False, ran=True, x_ok=True, y_ok=False, z_ok=True, raw=0xEF)
     sampling(h, clock)
-    h.storage_update(None, "write failed: disk I/O error")
+    h.storage_status(None, {"write": "write failed: disk I/O error"})
     snap = h.snapshot()
     assert snap["state"] == "degraded"
     assert snap["detail"] == "Self test failed on Y; readings are suspect. Storage: write failed: disk I/O error"
@@ -121,7 +149,7 @@ def test_a_storage_problem_does_not_hide_a_sensor_state(sensor_state):
         h.no_sensor("test bus", "No RM3100 answered")
     else:
         clock.now += 60
-    h.storage_update(None, "write failed: disk I/O error")
+    h.storage_status(None, {"write": "write failed: disk I/O error"})
     snap = h.snapshot()
     assert snap["state"] == sensor_state
     assert snap["errors"][-1] == "write failed: disk I/O error"

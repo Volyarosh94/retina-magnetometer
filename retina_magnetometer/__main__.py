@@ -3,8 +3,8 @@
 Three threads and a web server in one process: the sampler talks to the
 sensor, the recorder writes to disk and keeps status.json current, and
 waitress serves the page and the API. SIGTERM (``docker stop``) stops the
-sampler, flushes what is buffered and exits; nothing buffered is lost on a
-clean stop.
+sampler, flushes what is buffered, closes the database and exits; nothing
+buffered is lost on a clean stop.
 
 What the app finds at start does not stop it: a container that exits is
 restarted into the same problem, and the page that would explain it never
@@ -94,6 +94,9 @@ def main() -> int:
     finally:
         sampler.stop()
         recorder.stop()
+        # The last checkpoint: the database is left whole in its one file,
+        # the WAL taken into it and removed, for a copy or a backup.
+        storage.close()
         log.info("stopped")
     return 0
 

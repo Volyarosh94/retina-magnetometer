@@ -3,6 +3,7 @@ and a database that cannot be opened or read."""
 
 import math
 import os
+import random
 import shutil
 import sqlite3
 import time
@@ -12,7 +13,9 @@ import pytest
 
 from retina_magnetometer import series
 from retina_magnetometer import storage as storage_module
+from retina_magnetometer.rm3100 import registers
 from retina_magnetometer.storage import (
+    EMPTY_DB_BYTES,
     MINUTE_ROW_BYTES,
     SAMPLE_ROW_BYTES,
     SCHEMA_VERSION,
@@ -204,15 +207,130 @@ def test_retention(tmp_path):
 
 
 def test_rows_take_the_bytes_the_size_cap_assumes(tmp_path):
-    s = make(tmp_path)
+    # SAMPLE_ROW_BYTES and MINUTE_ROW_BYTES, measured again on the app's own
+    # write path: the size cap steps by them and the configuration's capacity
+    # note promises history from them. If the schema changes, the figures
+    # must be measured again.
+    s = Storage(
+        tmp_path / "m.sqlite",
+        raw_retention_days=3650,
+        rollup_retention_days=36500,
+        max_db_mb=1_000_000,
+        clock=lambda: T0 / 1000 + 1e6,
+    )
     empty = data_bytes(s)
-    s.write_samples(readings(T0, 50_000))
-    per_sample = (data_bytes(s) - empty) / 50_000
-    before = data_bytes(s)
-    add_minutes(s, T0, 20_000)
-    per_minute = (data_bytes(s) - before) / 20_000
-    assert per_sample == pytest.approx(SAMPLE_ROW_BYTES, rel=0.1)
-    assert per_minute == pytest.approx(MINUTE_ROW_BYTES, rel=0.1)
+    assert abs(empty - EMPTY_DB_BYTES) <= 2 * 4096
+    rng = random.Random(1)
+    gain = registers.gain_lsb_per_ut(200)
+
+    def reading(base):  # quantised counts at 200 cycles, as the driver hands them over
+        return round((base + rng.gauss(0, 15)) * gain / 1000) * 1000 / gain
+
+    rows = [(T0 + i * 1000, reading(22398.0), reading(-2761.0), reading(43002.0)) for i in range(6 * 3600)]
+    for i in range(0, len(rows), 600):
+        s.write_samples(rows[i : i + 600])
+    with_samples = data_bytes(s)
+    # Page granularity moves the figure by less than 0.4 % at this size; the
+    # sizes do not depend on the readings.
+    assert (with_samples - empty) / len(rows) == pytest.approx(SAMPLE_ROW_BYTES, rel=0.006)
+    minutes = []
+    for i in range(10 * 1440):
+        values = []
+        for base in (22398.0, -2761.0, 43002.0, 48564.0):
+            mean = base + rng.gauss(0, 2)
+            values += [mean - abs(rng.gauss(30, 5)), mean, mean + abs(rng.gauss(30, 5))]
+        minutes.append((T0 - 30 * DAY + i * 60_000, 60, *values))
+    db = sqlite3.connect(s.path, isolation_level=None)
+    db.execute("BEGIN")
+    db.executemany("INSERT INTO minutes VALUES (" + ", ".join("?" * 14) + ")", minutes)
+    db.execute("COMMIT")
+    db.close()
+    assert (data_bytes(s) - with_samples) / len(minutes) == pytest.approx(MINUTE_ROW_BYTES, rel=0.006)
+
+
+def test_writes_go_to_the_wal_and_leave_the_database_file_alone(tmp_path):
+    # One writer connection, kept open: a flush appends to the WAL. A
+    # connection per write made every flush the last one to close, and SQLite
+    # checkpoints and deletes the WAL then: the pages written twice and two
+    # syncs, every few seconds, on an SD card.
+    s = make(tmp_path)
+    s.write_samples(ramp(T0, 5))
+    wal = Path(f"{s.path}-wal")
+    before = s.path.read_bytes()
+    sizes = []
+    for i in range(1, 21):
+        s.write_samples(ramp(T0 + i * 5000, 5))
+        assert wal.exists()
+        sizes.append(wal.stat().st_size)
+    assert s.path.read_bytes() == before  # not written: no checkpoint
+    assert sizes == sorted(sizes) and sizes[-1] > sizes[0]
+    # The prune's checkpoint moves it all into the file, and truncates the WAL.
+    s.prune(now_ms=T0 + 200_000)
+    assert wal.stat().st_size == 0 and s.path.read_bytes() != before
+    assert s.stats()["samples"] == 105
+    # A clean stop folds the WAL in and removes it.
+    s.write_samples(ramp(T0 + 200_000, 1))
+    s.close()
+    assert not wal.exists()
+    assert s.stats()["samples"] == 106  # and the next call opens it again
+
+
+@pytest.mark.parametrize("window_ms,max_points", [(3_600_000, 1800), (21_600_000, 1800), (90 * 86_400_000, 1800)])
+def test_series_since_is_the_tail_of_the_whole_answer(tmp_path, monkeypatch, window_ms, max_points):
+    # What is new since a client's newest point, worked out only from the
+    # bucket it is in, is exactly the end of the full answer: the buckets sit
+    # on a fixed grid. And |B| is worked out once a sample, not once for each
+    # of MIN, AVG and MAX.
+    s = make(tmp_path, raw_retention_days=3650, rollup_retention_days=36500)
+    end = T0 + 21_600_000
+    s.write_samples(readings(end - 6 * 3_600_000, 6 * 3600 * 4, step_ms=250))  # six hours at 4 Hz
+    s.rollup(now_ms=end + 60_000)
+    start = end - window_ms
+    full = s.series(start, end, max_points)
+    calls = []
+    magnitude = series.magnitude
+
+    def counted(x, y, z):
+        calls.append(1)
+        return magnitude(x, y, z)
+
+    monkeypatch.setattr(storage_module.shape, "magnitude", counted)
+    middle = full["t"][len(full["t"]) // 2]
+    for since in (full["t"][-1], middle, middle + 1, start - 1, end + 1):
+        calls.clear()
+        part = s.series(start, end, max_points, since_ms=since)
+        assert series.tail(part, since) == series.tail(full, since)
+        if full["source"] == "samples":
+            # Only the samples from the bucket before the one ``since`` is in,
+            # once each.
+            first = max(start, (since // full["bucket_ms"] - 1) * full["bucket_ms"])
+            assert len(calls) == len([t for t in range(end - 6 * 3_600_000, end, 250) if first <= t < end])
+
+
+@pytest.mark.parametrize("source", ["samples", "memory", "minutes"])
+def test_series_since_a_gap_mark_keeps_the_mark(tmp_path, source):
+    # A gap is marked one bucket after the last one before it. A client
+    # asking from exactly there gets the mark, as the end of the full answer
+    # has it, and every other point as that has it too.
+    s = make(tmp_path, raw_retention_days=3650, rollup_retention_days=36500)
+    step, hole = (1000, (120_000, 180_000)) if source != "minutes" else (60_000, (10 * 3_600_000, 14 * 3_600_000))
+    span = 600_000 if source != "minutes" else 86_400_000
+    rows = [r for r in readings(T0, span // step, step_ms=step) if not hole[0] <= r[0] - T0 < hole[1]]
+    s.write_samples(rows)
+    s.rollup(now_ms=T0 + span + 60_000)
+    points = 100 if source != "minutes" else 200
+
+    def answer(since=None):
+        if source == "memory":
+            return series.bucket_rows(rows, T0, T0 + span, points, since_ms=since)
+        return s.series(T0, T0 + span, points, since_ms=since)
+
+    full = answer()
+    assert full["source"] == source
+    marks = [t for t, n in zip(full["t"], full["n"]) if n == 0]
+    assert len(marks) == 1
+    for since in (marks[0], marks[0] - 1, marks[0] + 1, full["t"][full["t"].index(marks[0]) + 1]):
+        assert series.tail(answer(since), since) == series.tail(full, since)
 
 
 def test_size_cap_drops_oldest_first(tmp_path):
@@ -235,16 +353,19 @@ def test_size_cap_drops_oldest_first(tmp_path):
     assert after["size_capped_ms"] == T0 + 300_000_000
 
 
-def test_size_cap_removes_no_more_while_a_reader_holds_a_snapshot(tmp_path, monkeypatch):
+def test_size_cap_with_a_reader_holding_a_snapshot(tmp_path, monkeypatch):
     # A reader in a transaction (an open sqlite3 shell, a slow query) keeps
-    # the WAL from being checkpointed, so the file cannot shrink while it is
-    # there. The cap must still remove only what the data's size calls for,
-    # and must not hold the writer for long waiting for it.
+    # the WAL from being checkpointed. The cap must not delete beyond what
+    # the data's size calls for (it once wiped everything), must not hold the
+    # writer for long, and must not pile its deletions up in a WAL it cannot
+    # empty, the disk filling as the data shrink: it takes one step, waits
+    # for the reader, and a later prune finishes.
     monkeypatch.setattr(storage_module, "CHECKPOINT_WAIT_MS", 50)
     template = make(tmp_path / "template", max_db_mb=3, raw_retention_days=3650, rollup_retention_days=36500)
     template.write_samples(readings(T0, 120_000))
     template.rollup(now_ms=T0 + 120_000_000)
     assert data_bytes(template) > template.max_bytes
+    template.close()  # the WAL into the file, which is what is copied
     for name in ("alone", "read"):
         (tmp_path / name).mkdir()
         shutil.copy(template.path, tmp_path / name / "m.sqlite")
@@ -253,25 +374,29 @@ def test_size_cap_removes_no_more_while_a_reader_holds_a_snapshot(tmp_path, monk
     minutes = read.stats()["minutes"]
 
     expected = alone.prune(now_ms=T0 + 120_000_000)
+    assert expected["size_capped"] is True and "deferred" not in expected
     reader = sqlite3.connect(read.path, isolation_level=None)
     reader.execute("BEGIN")
     reader.execute("SELECT COUNT(*) FROM samples").fetchone()
     started = time.monotonic()
-    removed = read.prune(now_ms=T0 + 120_000_000)
+    first = read.prune(now_ms=T0 + 120_000_000)
     held = time.monotonic() - started
     stats = read.stats()
 
-    assert removed == expected and removed["size_capped"] is True
-    assert 0 < removed["samples"] < 120_000 and removed["minutes"] == 0
+    assert first["size_capped"] is True and first["deferred"] is True
+    assert 0 < first["samples"] < expected["samples"] and first["minutes"] == 0
     assert stats["minutes"] == minutes and stats["newest_sample_ms"] == T0 + 119_999_000
-    assert data_bytes(read) <= read.max_bytes * 0.9
     assert held < 10  # under one 10 s busy timeout, which each step of the old loop waited out
-    # The WAL could not be truncated while the reader held it; the next prune,
-    # with the reader gone, returns the space, and removes nothing more.
+    # One step's worth in the WAL (a megabyte of data, and the pages that
+    # point at it), not the whole cut, and no page moved to shrink the file.
+    assert Path(f"{read.path}-wal").stat().st_size < 2 * 1024 * 1024
     reader.execute("COMMIT")
     reader.close()
+    second = read.prune(now_ms=T0 + 120_000_000)
+    assert "deferred" not in second
+    assert first["samples"] + second["samples"] == expected["samples"]
+    assert data_bytes(read) <= read.max_bytes * 0.9 and read.stats()["bytes"] <= read.max_bytes
     assert read.prune(now_ms=T0 + 120_000_000) == {"samples": 0, "minutes": 0, "size_capped": False}
-    assert read.stats()["bytes"] <= read.max_bytes
 
 
 def test_size_cap_below_the_minute_table_keeps_the_newest_samples(tmp_path):
@@ -446,21 +571,50 @@ def test_a_newer_versions_database_is_left_as_it_is(tmp_path, readable):
 
 
 def test_a_database_deleted_while_the_app_runs_is_started_afresh(tmp_path):
-    # Deleting the file (an operator clearing the history) leaves SQLite to
-    # make an empty one at the next connection; the next call creates the
-    # schema in it, in WAL mode, instead of failing until a restart.
+    # Deleting the file (an operator clearing the history) must not leave the
+    # writer, which keeps its connection open, writing into the deleted file
+    # where nothing can see it: the next call starts a new database, in WAL
+    # mode, and writes there.
     s = make(tmp_path)
     s.write_samples(ramp(T0, 3))
     for suffix in ("", "-wal", "-shm"):
         Path(f"{s.path}{suffix}").unlink(missing_ok=True)
-    with pytest.raises(sqlite3.OperationalError, match="no such table: samples"):
-        s.write_samples(ramp(T0 + 3000, 3))
-    s.write_samples(ramp(T0 + 6000, 3))
+    s.write_samples(ramp(T0 + 3000, 3))
     stats = s.stats()
-    assert stats["samples"] == 3 and stats["oldest_sample_ms"] == T0 + 6000
+    assert stats["samples"] == 3 and stats["oldest_sample_ms"] == T0 + 3000
     assert sqlite3.connect(s.path).execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     s.start_session(cycle_count=200, gain=74.92, rate_hz=1.0, mode="poll", bus="b", address=0x20)
     assert len(s.sessions()) == 1
+    # A file put in its place is read, not written over.
+    s.close()
+    replacement = make(tmp_path / "elsewhere")
+    replacement.write_samples(ramp(T0, 10))
+    replacement.close()
+    os.replace(replacement.path, s.path)
+    assert s.stats()["samples"] == 10
+    s.write_samples(ramp(T0 + 60_000, 1))
+    assert s.stats()["samples"] == 11
+
+
+def test_a_clean_stop_leaves_a_database_put_in_its_place_alone(tmp_path):
+    # A backup restored while the app runs, copied with its WAL as a live
+    # database is. A clean stop leaves it as it is, the WAL beside it too:
+    # the writer's own WAL is folded into its file, and removed (by name),
+    # only while the path is still that file.
+    s = make(tmp_path)
+    s.write_samples(ramp(T0, 3))
+    backup = make(tmp_path / "backup")
+    backup.write_samples(ramp(T0 + 60_000, 10))  # still in its WAL
+    for suffix in ("", "-wal"):
+        shutil.copyfile(f"{backup.path}{suffix}", tmp_path / f"restored{suffix}")
+    backup.close()
+    os.replace(tmp_path / "restored-wal", f"{s.path}-wal")
+    os.replace(tmp_path / "restored", s.path)
+    restored = s.path.read_bytes()
+    s.close()
+    assert s.path.read_bytes() == restored
+    stats = s.stats()
+    assert stats["samples"] == 10 and stats["oldest_sample_ms"] == T0 + 60_000
 
 
 def test_a_database_replaced_while_the_app_runs_is_moved_aside_next_time(tmp_path):

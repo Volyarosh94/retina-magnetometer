@@ -40,6 +40,17 @@ def bucket_width(start_ms: int, end_ms: int, max_points: int) -> int:
     return max(1, math.ceil(max(1, end_ms - start_ms) / max_points))
 
 
+def bucketed_from(start_ms: int, bucket_ms: int, since_ms: int | None) -> int:
+    """Where the samples to bucket begin: the window's start, or, for only
+    what is new since ``since_ms``, the bucket before the one it falls in.
+    The buckets before that are what the client already holds. That one is
+    too, but a gap after it is marked one bucket on, which can be the very
+    time ``since_ms`` asks from; the caller takes the tail."""
+    if since_ms is None:
+        return start_ms
+    return max(start_ms, (since_ms // bucket_ms - 1) * bucket_ms)
+
+
 def empty(source: str, bucket_ms: int) -> dict:
     out: dict = {"t": [], "n": [], "source": source, "bucket_ms": bucket_ms}
     for axis in AXES:
@@ -106,16 +117,19 @@ def bucketed_points(rows, bucket_ms: int, source: str) -> dict:
     return out
 
 
-def bucket_rows(rows, start_ms: int, end_ms: int, max_points: int, source: str = "memory") -> dict:
+def bucket_rows(
+    rows, start_ms: int, end_ms: int, max_points: int, source: str = "memory", since_ms: int | None = None
+) -> dict:
     """``Storage.series`` for rows already in memory (in time order): same
-    shape, same rules."""
+    shape, same rules, ``since_ms`` included."""
     rows = [r for r in rows if start_ms <= r[0] < end_ms]
     max_points = clamp_points(max_points)
     if len(rows) <= max_points:
         return raw_points(rows, source)
     bucket = bucket_width(start_ms, end_ms, max_points)
+    first = bucketed_from(start_ms, bucket, since_ms)
     groups: dict[int, list] = {}
-    for t, x, y, z in rows:
+    for t, x, y, z in rows[bisect.bisect_left(rows, (first,)) :]:
         groups.setdefault(t // bucket, []).append((x, y, z, magnitude(x, y, z)))
     summarised = []
     for k in sorted(groups):

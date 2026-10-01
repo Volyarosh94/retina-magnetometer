@@ -1,8 +1,6 @@
 """Environment configuration: defaults, parsing, and errors that do not crash."""
 
-import random
 import socket
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -11,6 +9,7 @@ from retina_magnetometer import config as config_module
 from retina_magnetometer.config import from_env
 from retina_magnetometer.rm3100 import registers as reg
 from retina_magnetometer.rm3100.driver import RM3100
+from retina_magnetometer.storage import EMPTY_DB_BYTES, MINUTE_ROW_BYTES, SAMPLE_ROW_BYTES
 
 
 def env(**values):
@@ -224,61 +223,11 @@ def test_warnings_reach_the_public_view():
 
 
 def held_days(cap_mb, rate_hz, share=None, minute_days=365):
-    """What the size cap leaves for raw samples, from the measured row sizes."""
-    room = cap_mb * 1024 * 1024 * 0.9 - config_module.EMPTY_DB_BYTES
-    raw_room = room * share if share is not None else room - minute_days * 1440 * config_module.MINUTE_BYTES
-    return raw_room / (rate_hz * 86_400 * config_module.SAMPLE_BYTES)
-
-
-def test_the_row_sizes_are_what_the_storage_schema_takes(tmp_path):
-    # The capacity note's figures, measured again the way they were first
-    # measured: on the app's own schema and write path, as the size cap counts
-    # the data. If the schema changes, the figures must be measured again.
-    from retina_magnetometer.storage import MINUTE_MS, Storage
-
-    t0 = 1_790_726_400_000
-    path = tmp_path / "m.sqlite"
-    storage = Storage(
-        path, raw_retention_days=3650, rollup_retention_days=36500, max_db_mb=1_000_000, clock=lambda: t0 / 1000 + 1e6
-    )
-
-    def data_bytes():
-        db = sqlite3.connect(path)
-        pages, free, size = (
-            db.execute(f"PRAGMA {name}").fetchone()[0] for name in ("page_count", "freelist_count", "page_size")
-        )
-        db.close()
-        return (pages - free) * size
-
-    empty = data_bytes()
-    assert abs(empty - config_module.EMPTY_DB_BYTES) <= 2 * 4096
-    rng = random.Random(1)
-    gain = reg.gain_lsb_per_ut(200)
-
-    def reading(base):  # quantised counts at 200 cycles, as the driver hands them over
-        return round((base + rng.gauss(0, 15)) * gain / 1000) * 1000 / gain
-
-    rows = [(t0 + i * 1000, reading(22398.0), reading(-2761.0), reading(43002.0)) for i in range(6 * 3600)]
-    for i in range(0, len(rows), 600):
-        storage.write_samples(rows[i : i + 600])
-    with_samples = data_bytes()
-    # Page granularity moves the figure by less than 0.4 % at this size; the
-    # sizes do not depend on the readings.
-    assert (with_samples - empty) / len(rows) == pytest.approx(config_module.SAMPLE_BYTES, rel=0.006)
-
-    minutes = []
-    for i in range(10 * 1440):
-        values = []
-        for base in (22398.0, -2761.0, 43002.0, 48564.0):
-            mean = base + rng.gauss(0, 2)
-            values += [mean - abs(rng.gauss(30, 5)), mean, mean + abs(rng.gauss(30, 5))]
-        minutes.append((t0 - 30 * 86_400_000 + i * MINUTE_MS, 60, *values))
-    db = sqlite3.connect(path, isolation_level=None)
-    db.execute("BEGIN")
-    db.executemany("INSERT INTO minutes VALUES (" + ", ".join("?" * 14) + ")", minutes)
-    db.execute("COMMIT")
-    db.close()
-    assert (data_bytes() - with_samples) / len(minutes) == pytest.approx(config_module.MINUTE_BYTES, rel=0.006)
+    """What the size cap leaves for raw samples, from the row sizes the
+    storage tests measure."""
+    room = cap_mb * 1024 * 1024 * 0.9 - EMPTY_DB_BYTES
+    raw_room = room * share if share is not None else room - minute_days * 1440 * MINUTE_ROW_BYTES
+    return raw_room / (rate_hz * 86_400 * SAMPLE_ROW_BYTES)
 
 
 def test_a_default_configuration_has_no_capacity_note():
@@ -302,8 +251,8 @@ def test_a_cap_too_small_for_the_raw_retention_says_how_much_it_holds():
 def test_a_cap_too_small_for_the_minute_summaries_cuts_both():
     # Once the summaries give way too, the raw samples keep half the room.
     c = from_env(env(MAX_DB_MB="16"))
-    room = 16 * 1024 * 1024 * 0.9 - config_module.EMPTY_DB_BYTES
-    minute_days = room / 2 / (1440 * config_module.MINUTE_BYTES)
+    room = 16 * 1024 * 1024 * 0.9 - EMPTY_DB_BYTES
+    minute_days = room / 2 / (1440 * MINUTE_ROW_BYTES)
     (note,) = c.notes
     assert note == (
         f"MAGNETOMETER_MAX_DB_MB=16 holds about {held_days(16, 1, share=0.5):.1f} days of raw samples at 1 Hz, "
@@ -313,8 +262,8 @@ def test_a_cap_too_small_for_the_minute_summaries_cuts_both():
 
 def test_raw_samples_that_fit_keep_their_retention_while_the_minutes_give_way():
     c = from_env(env(MAX_DB_MB="16", RAW_RETENTION_DAYS="1"))
-    room = 16 * 1024 * 1024 * 0.9 - config_module.EMPTY_DB_BYTES
-    minute_days = (room - 86_400 * config_module.SAMPLE_BYTES) / (1440 * config_module.MINUTE_BYTES)
+    room = 16 * 1024 * 1024 * 0.9 - EMPTY_DB_BYTES
+    minute_days = (room - 86_400 * SAMPLE_ROW_BYTES) / (1440 * MINUTE_ROW_BYTES)
     (note,) = c.notes
     assert note == (
         f"MAGNETOMETER_MAX_DB_MB=16 holds about {minute_days:.0f} days of minute summaries, "

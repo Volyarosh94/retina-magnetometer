@@ -28,6 +28,7 @@ from pathlib import Path
 
 from retina_magnetometer.rm3100 import registers as reg
 from retina_magnetometer.rm3100.driver import RM3100
+from retina_magnetometer.storage import EMPTY_DB_BYTES, MINUTE_ROW_BYTES, SAMPLE_ROW_BYTES
 
 PREFIX = "MAGNETOMETER_"
 
@@ -101,19 +102,6 @@ class Config:
         }
 
 
-# What the data take in the database, measured as the size cap measures them,
-# (page_count - freelist_count) * page_size before and after, on the app's own
-# schema and write path (storage.Storage: 4 KiB pages, incremental
-# auto-vacuum): a day of 1 Hz readings, quantised as the driver hands them
-# over and written a minute per transaction through write_samples, took
-# 38.45 B a sample, and a day at 10 Hz the same; the roll-up of a week of
-# them took 124.75 B a minute summary, as did a month of minute rows written
-# straight into the table (124.68). The empty database is seven pages.
-SAMPLE_BYTES = 38.45
-MINUTE_BYTES = 124.75
-EMPTY_DB_BYTES = 7 * 4096
-
-
 def _span(days: float) -> str:
     if days < 1.0:
         return f"{days * 24:.1f} hours"
@@ -134,11 +122,12 @@ def _capacity_note(max_db_mb: float, stored_rate_hz: float, raw_days: float, rol
     raw samples the minute summaries already cover, and while the summaries
     must give way as well, the raw samples keep half of that room. Between
     prunes the data grow back towards the cap, so this is the least the
-    database holds, not the most.
+    database holds, not the most. The bytes a row takes are measured where the
+    schema is, and measured again by its tests.
     """
     room = max_db_mb * 1024 * 1024 * 0.9 - EMPTY_DB_BYTES
-    sample_day = stored_rate_hz * 86_400 * SAMPLE_BYTES
-    minute_day = 1440 * MINUTE_BYTES
+    sample_day = stored_rate_hz * 86_400 * SAMPLE_ROW_BYTES
+    minute_day = 1440 * MINUTE_ROW_BYTES
     raw_need, minutes_need = raw_days * sample_day, rollup_days * minute_day
     if raw_need + minutes_need <= room:
         return None

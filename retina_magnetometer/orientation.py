@@ -199,6 +199,13 @@ def _opposite(axis: str) -> str:
     return ("-" if axis[0] == "+" else "+") + axis[1]
 
 
+def _bearing(degrees: float) -> float:
+    """An angle as a bearing, in [0, 360). Python's ``%`` gives 360.0 itself
+    for an angle a hair below 0 (-1e-14 % 360 rounds up), which is not one."""
+    bearing = degrees % 360.0
+    return 0.0 if bearing >= 360.0 else bearing
+
+
 def estimate(measured: Vec, samples: int, reference: Reference | None) -> Orientation:
     """Orientation from a mean field vector (sensor frame, nT) and, if the
     node's location is known, the model field there."""
@@ -317,10 +324,10 @@ def estimate(measured: Vec, samples: int, reference: Reference | None) -> Orient
         )
     north = (horizontal[0] / h_len, horizontal[1] / h_len, horizontal[2] / h_len)
     # Clockwise from magnetic north, looking down: atan2((n x r) . d, n . r).
-    heading_mag = (
-        math.degrees(math.atan2(_dot(_cross(north, reference_axis), down), _dot(north, reference_axis))) % 360.0
+    heading_mag = _bearing(
+        math.degrees(math.atan2(_dot(_cross(north, reference_axis), down), _dot(north, reference_axis)))
     )
-    heading_true = (heading_mag + reference.declination_deg) % 360.0
+    heading_true = _bearing(heading_mag + reference.declination_deg)
 
     # Error budget, combined in quadrature: the model's declination error; a
     # tilt of tau shifts the apparent heading by up to ~tau * tan(inclination);

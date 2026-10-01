@@ -45,6 +45,25 @@ class TestRecovery:
         assert est.verdict == "good"
         assert est.magnitude_ratio == pytest.approx(1.0)
 
+    @pytest.mark.parametrize(
+        "yaw,roll",
+        [(360.0, 0.0), (360.0 + REF.declination_deg, 0.0), (360.0 + REF.declination_deg, 180.0)],
+    )
+    def test_a_heading_due_north_is_0_not_360(self, yaw, roll):
+        # Due north (true, or magnetic), the arithmetic lands a hair either
+        # side of zero, and Python's % makes a hair below it 360.0 itself.
+        est = o.estimate(mounted(yaw, roll=roll), 60, REF)
+        for heading in (est.heading_true_deg, est.heading_magnetic_deg):
+            assert 0.0 <= heading < 360.0
+        assert min(est.heading_true_deg, est.heading_magnetic_deg) < 1e-9
+
+    def test_headings_are_bearings_all_the_way_round(self):
+        for k in range(-1440, 1441):
+            est = o.estimate(mounted(k / 4), 60, REF)
+            assert 0.0 <= est.heading_true_deg < 360.0
+            assert 0.0 <= est.heading_magnetic_deg < 360.0
+            assert angle_diff(est.heading_true_deg, k / 4) < 0.01
+
     def test_upside_down_rotated_mount_like_the_demo(self):
         est = o.estimate(mounted(37.0, roll=180.0), 60, REF)
         assert est.down_axis == "-Z" and est.up_axis == "+Z"

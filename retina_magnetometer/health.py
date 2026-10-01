@@ -18,6 +18,7 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,10 +49,9 @@ _RATE_WINDOW_S = 60.0
 _KEEP_UP = 0.9
 _MISSED_AT_LEAST = 3
 
-# A storage problem that comes back within this long of its last report is
-# the same problem and is not listed again (the recorder clears it whenever a
-# write gets through in between, and a roll-up or prune that keeps failing
-# comes back on its own schedule).
+# A storage operation that fails again within this long of its last report,
+# the same way, is the same problem and is not listed again: one that keeps
+# failing and working in turn (a prune during a backfill) is listed once.
 _STORAGE_RELIST_S = 900.0
 
 
@@ -99,7 +99,8 @@ class Health:
         self._quiet_says = ""
         self.storage: dict | None = None
         self.storage_error: str | None = None
-        self._storage_reported: dict[str, float] = {}  # message -> last reported (monotonic)
+        # (operation, message) -> when last reported (monotonic)
+        self._storage_reported: dict[tuple[str, str], float] = {}
 
     # ── Updates ──────────────────────────────────────────────────────────────
 
@@ -181,7 +182,8 @@ class Health:
         """A failed read or a sensor that answered wrongly."""
         with self._lock:
             self._record_error(kind, message)
-            if self.state in ("ok", "starting", "degraded", "stalled"):
+            # "stalled" is never stored: snapshot() works it out from the time.
+            if self.state in ("ok", "starting", "degraded"):
                 self.state = "degraded"
                 self.detail = f"{kind}: {message}"
 
@@ -191,7 +193,7 @@ class Health:
         with self._lock:
             self.internal_errors_total += 1
             self.recent_errors.append({"at": _iso(self._clock()), "kind": "internal error", "message": message})
-            if self.state in ("ok", "starting", "degraded", "stalled"):
+            if self.state in ("ok", "starting", "degraded"):
                 self.state = "degraded"
                 self.detail = f"internal error: {message}"
 
@@ -209,22 +211,30 @@ class Health:
             self._missed_ticks.append((t, ticks, measurement_s))
             self._trim(t)
 
-    def storage_update(self, stats: dict | None, error: str | None = None) -> None:
+    def storage_status(self, stats: dict | None, failing: Mapping[str, str]) -> None:
+        """The storage figures, if there are new ones, and the storage
+        operations failing now, by name, with how each fails.
+
+        ``storage_error`` and the detail are all of them together. The recent
+        errors list each operation when it starts failing, or fails another
+        way, and not again while it goes on failing or comes back the same way
+        within _STORAGE_RELIST_S of its last report: operations failing and
+        recovering in turn are not each a new problem, and listing them as
+        such would push the read errors out of the list. A storage error is
+        not a read error, so the read counts stay put.
+        """
         with self._lock:
             if stats is not None:
                 self.storage = stats
-            if error is not None:
-                now = self._monotonic()
-                for message, reported in list(self._storage_reported.items()):
-                    if now - reported > _STORAGE_RELIST_S:
-                        del self._storage_reported[message]
-                if error not in self._storage_reported:
-                    # Listed once when it starts, or comes back after a long
-                    # absence; it is not a read error, so the read counts
-                    # stay put.
-                    self.recent_errors.append({"at": _iso(self._clock()), "kind": "storage", "message": error})
-                self._storage_reported[error] = now
-            self.storage_error = error
+            now = self._monotonic()
+            for listed, reported in list(self._storage_reported.items()):
+                if now - reported > _STORAGE_RELIST_S:
+                    del self._storage_reported[listed]
+            for operation, message in failing.items():
+                if (operation, message) not in self._storage_reported:
+                    self.recent_errors.append({"at": _iso(self._clock()), "kind": "storage", "message": message})
+                self._storage_reported[(operation, message)] = now
+            self.storage_error = "; ".join(failing.values()) or None
 
     # ── Reads ────────────────────────────────────────────────────────────────
 

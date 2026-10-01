@@ -136,15 +136,16 @@ def api_series():
     if end <= start or end - start > MAX_WINDOW_S * 1000:
         abort(400, description="need start < end, at most 400 days apart")
     try:
-        data = _series(s, start, end, points)
+        data = _series(s, start, end, points, since)
     except (sqlite3.Error, OSError) as exc:
         # The database cannot be read (the storage card says why); the live
         # buffer still can, so the chart shows what it holds.
-        data = series.bucket_rows(s.recorder.recent(start), start, end, points)
+        data = series.bucket_rows(s.recorder.recent(start), start, end, points, since_ms=since)
         data["warning"] = f"Stored history unavailable ({exc}); showing the live buffer only."
     if since is not None:
-        # Everything before ``since`` is what the client already holds: the
-        # whole series is worked out as usual, so gaps and buckets agree.
+        # Everything before ``since`` is what the client already holds. The
+        # buckets are those of the whole window, worked out only from the one
+        # ``since`` is in, so they and their gaps agree with a full answer.
         data = series.tail(data, since)
         data["since"] = since
     data.update({"start": start, "end": end, "now": now_ms})
@@ -157,8 +158,9 @@ def api_series():
 MERGE_ROW_LIMIT = 200_000
 
 
-def _series(s: Services, start: int, end: int, points: int) -> dict:
-    """Chart data for [start, end], from wherever it is freshest and cheapest.
+def _series(s: Services, start: int, end: int, points: int, since: int | None = None) -> dict:
+    """Chart data for [start, end], from wherever it is freshest and cheapest
+    (from the bucket ``since`` falls in on, if given).
 
     The in-memory buffer holds the last hour, including the seconds not yet
     flushed; the database holds everything else. A range inside the buffer
@@ -170,15 +172,16 @@ def _series(s: Services, start: int, end: int, points: int) -> dict:
     """
     covered_from = s.recorder.recent_coverage_ms()
     if covered_from is None:
-        return s.storage.series(start, end, points)
+        return s.storage.series(start, end, points, since)
     if start >= covered_from:
-        return series.bucket_rows(s.recorder.recent(start), start, end, points)
+        return series.bucket_rows(s.recorder.recent(start), start, end, points, since_ms=since)
     if end <= covered_from or (end - start) / points >= 60_000:
-        return s.storage.series(start, end, points)
+        return s.storage.series(start, end, points, since)
     older = s.storage.raw_rows(start, covered_from, MERGE_ROW_LIMIT)
     if older is None:
-        return s.storage.series(start, end, points)
-    return series.bucket_rows(older + s.recorder.recent(covered_from), start, end, points, source="samples+memory")
+        return s.storage.series(start, end, points, since)
+    rows = older + s.recorder.recent(covered_from)
+    return series.bucket_rows(rows, start, end, points, source="samples+memory", since_ms=since)
 
 
 @bp.get("/api/orientation")

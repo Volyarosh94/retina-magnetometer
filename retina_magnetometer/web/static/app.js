@@ -26,6 +26,10 @@
     const FULL_EVERY = 30;
     // Spans from which the scales fit the mean line rather than the band.
     const FIT_FROM_MS = 86400000;
+    // The narrowest scale, in nT. Fitted to a still sensor (or a quiet
+    // simulation), Plotly's ticks would fall a fraction of a nanotesla apart,
+    // and whole-number labels would repeat; a count is 3 to 40 nT anyway.
+    const MIN_SPAN_NT = 10;
 
     const $ = (id) => document.getElementById(id);
     const chartEl = $("chart");
@@ -48,6 +52,12 @@
     const nf1 = new Intl.NumberFormat("en-GB", { maximumFractionDigits: 1, minimumFractionDigits: 1 });
     const fmtNt = (v) => (v === null || v === undefined ? "–" : nf0.format(v));
     const fmtDeg = (v) => (v === null || v === undefined ? "–" : `${nf1.format(v)}°`);
+    // A bearing, rounded first and then wrapped: 359.97 is "0.0°", never
+    // "360.0°". Counted in tenths, which are whole numbers, so the wrap is exact.
+    const fmtBearing = (v) => (v === null || v === undefined ? "–" : `${nf1.format((((Math.round(v * 10) % 3600) + 3600) % 3600) / 10)}°`);
+    // A rate the app worked out (poll mode's ceiling, a measured one) to three
+    // figures, as the settings' warnings give it; 1 Hz stays "1 Hz".
+    const fmtHz = (v) => `${Number(v.toPrecision(3))} Hz`;
 
     function fmtAge(seconds) {
         if (seconds === null || seconds === undefined) return "never";
@@ -177,11 +187,28 @@
         return [lo - pad, hi + pad];
     }
 
+    // Everything drawn, band included, centred in MIN_SPAN_NT when it spans
+    // less; null when it spans more (Plotly fits it) or there is nothing.
+    function widenedRange(s) {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (const values of [s.min, s.mean, s.max]) {
+            for (const v of values) {
+                if (v === null) continue;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+        }
+        if (lo > hi || hi - lo >= MIN_SPAN_NT) return null;
+        const middle = (lo + hi) / 2;
+        return [middle - MIN_SPAN_NT / 2, middle + MIN_SPAN_NT / 2];
+    }
+
     // Per axis, the range the y scale is held to (null: Plotly fits it), and
     // whether any of the band runs past one.
     function scales(data) {
         const span = zoom ? zoom.end - zoom.start : windowS * 1000;
-        const ranges = AXES.map((axis) => (span >= FIT_FROM_MS && data.bucket_ms > 0 ? fitRange(data[axis.key].mean) : null));
+        const ranges = AXES.map((axis) => (span >= FIT_FROM_MS && data.bucket_ms > 0 ? fitRange(data[axis.key].mean) : widenedRange(data[axis.key])));
         const clipped = AXES.some((axis, i) => {
             const r = ranges[i];
             const s = data[axis.key];
@@ -335,9 +362,9 @@
         const st = h.self_test;
         const selfTest = !st ? "not run" : st.passed ? `passed (${fmtTime(st.at)})` : `FAILED on ${["x", "y", "z"].filter((a) => !st[`${a}_ok`]).join(", ").toUpperCase() || "sensor"} (BIST ${st.raw})`;
         const rate = [
-            `${h.configured_rate_hz} Hz configured`,
-            h.effective_rate_hz !== null ? `${Number(h.effective_rate_hz.toPrecision(3))} Hz effective` : null,
-            h.measured_rate_hz !== null ? `${Number(h.measured_rate_hz.toPrecision(3))} Hz measured` : null,
+            `${h.configured_rate_hz} Hz configured`, // as the operator wrote it
+            h.effective_rate_hz !== null ? `${fmtHz(h.effective_rate_hz)} effective` : null,
+            h.measured_rate_hz !== null ? `${fmtHz(h.measured_rate_hz)} measured` : null,
         ].filter(Boolean).join(" · ");
         facts($("health-facts"), [
             ["State", `${h.state_text}`, h.state === "ok" ? "" : STATE_CLASS[h.state] === "bad" ? "bad" : "warn"],
@@ -508,7 +535,7 @@
         }
         if (o.down_axis) {
             rows.push(["Pointing down", `${o.down_axis} (tilted at least ${fmtDeg(o.tilt_min_deg)})`, o.tilt_min_deg > 10 ? "warn" : ""]);
-            if (hasHeading(o)) rows.push([`${o.heading_axis} heading`, `${fmtDeg(o.heading_true_deg)} true (${fmtDeg(o.heading_magnetic_deg)} magnetic) ± ${nf1.format(o.heading_sigma_deg)}°`]);
+            if (hasHeading(o)) rows.push([`${o.heading_axis} heading`, `${fmtBearing(o.heading_true_deg)} true (${fmtBearing(o.heading_magnetic_deg)} magnetic) ± ${nf1.format(o.heading_sigma_deg)}°`]);
             else rows.push(["Heading", "none (see below)", "warn"]);
         }
         facts($("orient-facts"), rows);
@@ -543,7 +570,7 @@
             configRows = [
                 ["Bus", `${cfg.bus} (${cfg.i2c_framing})`],
                 ["Address", cfg.i2c_address],
-                ["Sampling", `${cfg.mode}, ${cfg.sample_rate_hz} Hz, ${cfg.cycle_count} cycles`],
+                ["Sampling", `${cfg.mode}, ${fmtHz(cfg.sample_rate_hz)}, ${cfg.cycle_count} cycles`],
                 ["Self test at start", cfg.self_test ? "yes" : "no"],
                 ["Retention", `raw ${cfg.raw_retention_days} days, minutes ${cfg.rollup_retention_days} days, cap ${cfg.max_db_mb} MB`],
                 ["Writes", `every ${cfg.flush_interval_s} s to ${cfg.data_dir}`],

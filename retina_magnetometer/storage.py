@@ -22,13 +22,27 @@ otherwise cost every raw sample at each prune, so while both tables have to
 give way, the raw samples keep half of the room. The size measured is the
 data's (the pages in use), not the file's: a reader holding an old snapshot
 keeps the WAL from being checkpointed, and deleting more rows could not
-shrink it. Freed pages are returned to the filesystem with incremental vacuum
-and the WAL is truncated, so the cap is a cap on disk use and not just on row
-counts.
+shrink it. What the cap bounds, then, is the data. The file follows at the
+next prune that finds no reader holding an old snapshot: freed pages go back
+to the filesystem then, a megabyte at a time with a checkpoint after each, so
+that reclaiming never needs much more room than it frees, and the WAL is
+truncated. Until then the freed pages stay inside the file, where new writes
+reuse them, so the file does not grow either.
 
 Written for an SD card. Samples are buffered and written in one transaction
 per flush (every few seconds), in WAL mode with synchronous=NORMAL: a power
-cut can lose the last flush, never the database.
+cut can lose the samples still buffered and the flushes the kernel had not
+yet written out (Linux writes data out once it is 30 s old), never the
+database. (synchronous=FULL would lose only those still buffered, for a sync
+of the WAL at every flush.) All writes go through one connection kept open
+for the life of the Storage. Closing the last connection to a database makes
+SQLite checkpoint and delete the WAL, and a connection per write would do
+that at every flush: four syncs, and every page written twice. With the
+connection kept open, a flush appends the pages it changed to the WAL (one,
+as a rule, at 1 Hz) and syncs nothing but the WAL's header when it starts
+again after a checkpoint. The database file is written, and synced, only at a
+checkpoint: each prune's, and SQLite's own whenever the WAL reaches 1,000
+pages. docs/hardware-verification.md (item 20) has the figures, measured.
 
 Opened lazily, and opened again whenever opening failed or the file went
 missing (deleted, or replaced, while the app runs). A data directory that
@@ -98,22 +112,35 @@ CREATE TABLE IF NOT EXISTS meta (
 
 MINUTE_MS = 60_000
 
-# What a row takes on disk with real readings (no column holds a whole number,
-# which SQLite would store as a small integer); tests/test_storage.py measures
-# both. The size cap sizes its steps and splits the room between the tables
-# with them. What it deletes is measured, so an error here costs steps, not
-# data.
-SAMPLE_ROW_BYTES = 36
-MINUTE_ROW_BYTES = 126
-# The rows one step of the size cap deletes, at least and at most: enough to
-# free whole pages, and a bounded transaction (and WAL) per step.
+# What the data take in the database, measured as the size cap measures them,
+# (page_count - freelist_count) * page_size before and after, on this schema
+# and write path (4 KiB pages, incremental auto-vacuum): a day of 1 Hz
+# readings, quantised as the driver hands them over and written a minute per
+# transaction through write_samples, took 38.45 B a sample, and a day at 10 Hz
+# the same; the roll-up of a week of them took 124.75 B a minute summary, as
+# did a month of minute rows written straight into the table (124.68). The
+# empty database is seven pages. tests/test_storage.py measures them again: a
+# schema change must come with new figures. The size cap sizes its steps and
+# splits the room between the tables with them, and the configuration's
+# capacity note works out how much history a cap holds from them. What the
+# cap deletes is measured, so an error here costs steps, not data.
+SAMPLE_ROW_BYTES = 38.45
+MINUTE_ROW_BYTES = 124.75
+EMPTY_DB_BYTES = 7 * 4096
+# What one step of the size cap deletes, at least and at most: enough rows to
+# free whole pages, and a bounded transaction, and WAL, per step (1 MiB of
+# data). Between steps a checkpoint takes the WAL into the file.
 CAP_STEP_MIN_ROWS = 256
-CAP_STEP_MAX_ROWS = 100_000
+CAP_STEP_MAX_BYTES = 1024 * 1024
 # How long the WAL truncation at each prune waits for readers. A reader holding
 # an old snapshot (a long query, an open sqlite3 shell) pins the WAL until it
 # finishes; the next prune tries again, rather than hold up the writer, and with
 # it every flush, for the full busy timeout.
 CHECKPOINT_WAIT_MS = 1000
+# Free pages handed back to the filesystem between two checkpoints: moving a
+# page writes it to the WAL, which only a checkpoint empties, so this bounds
+# what reclaiming needs on top of the file (4 MiB).
+RECLAIM_CHUNK_PAGES = 1024
 
 # Errors that mean the file is not a usable database at all, as opposed to one
 # that cannot be reached (permissions, a full or missing disk, a lock).
@@ -132,8 +159,9 @@ class StorageUnavailable(sqlite3.OperationalError):
 
 
 class Storage:
-    """One database file. Safe to share between threads: every call opens its
-    own short-lived connection except the writer's, which is serialised.
+    """One database file. Safe to share between threads: every read opens a
+    short-lived connection of its own, and every write goes through the one
+    long-lived writer connection, in turn, under a lock.
 
     Constructing one never fails. If the file cannot be opened, ``unavailable``
     says why and every call tries again before raising ``StorageUnavailable``,
@@ -156,6 +184,10 @@ class Storage:
         self._clock = clock
         self._write_lock = threading.Lock()
         self._ready = False
+        self._db: sqlite3.Connection | None = None  # the writer, while open
+        # The files it has open, by suffix ("" for the database itself), as
+        # (device, inode): the path may come to name others.
+        self._identity: dict[str, tuple[int, int] | None] = {}
         self.unavailable: str | None = None
         # Set when this run moved an unreadable file aside: when, why, and
         # where to (also kept in the new database's meta table).
@@ -165,28 +197,96 @@ class Storage:
         except StorageUnavailable as exc:
             log.error("%s; will keep trying", exc)
 
-    def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=10.0, isolation_level=None)
+    def _connect(self, *, writer: bool = False) -> sqlite3.Connection:
+        # The writer is used from more than one thread (the recorder's, and
+        # whichever opened it), always under the write lock.
+        db = sqlite3.connect(self.path, timeout=10.0, isolation_level=None, check_same_thread=not writer)
         db.execute("PRAGMA synchronous = NORMAL")
         db.execute("PRAGMA busy_timeout = 10000")
         db.create_function("magnitude", 3, shape.magnitude, deterministic=True)
         return db
 
+    def close(self) -> None:
+        """Close the writer: SQLite checkpoints and removes the WAL (by name),
+        if the path is still the file it opened, as SQLite also checks. The
+        next call opens it again."""
+        with self._write_lock:
+            self._close_writer(checkpoint=self._same_file())
+            self._ready = False
+
     # ── Opening ──────────────────────────────────────────────────────────────
 
     def _ensure_ready(self) -> None:
-        if self._ready:
+        if self._ready and self._same_file():
             return
         with self._write_lock:
-            if self._ready:
+            if self._ready and self._same_file():
                 return
+            self._ready = False
             try:
                 self._open()
             except (sqlite3.Error, OSError) as exc:
+                self._close_writer()
                 self.unavailable = f"cannot open {self.path}: {exc}"
                 raise StorageUnavailable(self.unavailable) from exc
             self.unavailable = None
             self._ready = True
+
+    def _same_file(self) -> bool:
+        """Whether the path is still the file the writer has open. Deleted or
+        replaced while the app runs, it is not, and an open connection would
+        go on writing into the old file where nothing can see it; SQLite does
+        not notice in WAL mode."""
+        return _identity(self.path) == self._identity.get("")
+
+    def _close_writer(self, *, checkpoint: bool = False) -> None:
+        """Close the writer. SQLite checkpoints when the last connection to a
+        database closes, which is wanted at a clean stop and not otherwise:
+        the writer is closed to open the file again because it went missing,
+        was replaced or reads as damaged, and a checkpoint would write into
+        whatever the file now is. Without one the WAL stays, for the next
+        connection to read, if it is still the database's (_drop_stale)."""
+        if self._db is not None:
+            try:
+                if not checkpoint:
+                    self._db.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+                self._db.close()
+            except sqlite3.Error:
+                pass
+        self._db = None
+
+    def _drop_stale(self) -> None:
+        """If the database last opened is no longer at the path (deleted, or
+        replaced by another file), its WAL and index still are, and SQLite
+        would read them into whatever database is there next. They go, before
+        that database is opened; only if they are the ones it had open, not
+        ones that came with a file put in its place."""
+        if not self._identity or self._same_file():
+            return
+        for suffix in ("-wal", "-shm"):
+            stale = Path(f"{self.path}{suffix}")
+            if _identity(stale) is not None and _identity(stale) == self._identity.get(suffix):
+                stale.unlink(missing_ok=True)
+                log.warning("%s is not the database that was open; removed what was left of it, %s", self.path, stale)
+        self._identity = {}
+
+    @contextmanager
+    def _writing(self) -> Iterator[sqlite3.Connection]:
+        """The writer, for one write call (under the write lock). A
+        transaction left open by an error is rolled back here, as closing a
+        connection used to."""
+        db = self._db
+        if db is None:  # closed since this call made sure it was open
+            raise StorageUnavailable(f"{self.path} is closed")
+        try:
+            yield db
+        except BaseException:
+            if db.in_transaction:
+                try:
+                    db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            raise
 
     @contextmanager
     def _opened(self) -> Iterator[None]:
@@ -202,7 +302,10 @@ class Storage:
             raise
 
     def _open(self) -> None:
+        self._close_writer()
+        self._drop_stale()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        moved = False
         try:
             self._create()
         except sqlite3.DatabaseError as exc:
@@ -215,16 +318,16 @@ class Storage:
                 raise StorageUnavailable(_newer(version)) from exc
             self._move_aside(exc)
             self._create()
+            moved = True
+        self._db = self._connect(writer=True)
+        if moved:
             # Kept in the new database, so the page explains the missing
             # history for as long as this database lasts, restarts included.
-            db = self._connect()
-            try:
-                db.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('moved_aside', ?)",
-                    (json.dumps(self.moved_aside),),
-                )
-            finally:
-                db.close()
+            self._db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('moved_aside', ?)", (json.dumps(self.moved_aside),)
+            )
+        self._db.execute("SELECT COUNT(*) FROM meta").fetchone()  # opens the WAL and its index
+        self._identity = {suffix: _identity(Path(f"{self.path}{suffix}")) for suffix in ("", "-wal", "-shm")}
 
     def _create(self) -> None:
         db = self._connect()
@@ -287,26 +390,22 @@ class Storage:
         """
         if not rows and not sessions:
             return
-        with self._opened(), self._write_lock:
-            db = self._connect()
-            try:
-                db.execute("BEGIN")
-                if sessions:
-                    db.executemany(
-                        "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        [_session_row(s) for s in sessions],
-                    )
-                if rows:
-                    db.executemany("INSERT OR REPLACE INTO samples (t_ms, x, y, z) VALUES (?, ?, ?, ?)", rows)
-                    watermark = _watermark(db)
-                    first = min(row[0] for row in rows)
-                    if watermark is not None and first < watermark:
-                        last = max(row[0] for row in rows)
-                        end = min(watermark, (last // MINUTE_MS + 1) * MINUTE_MS)
-                        _summarise(db, (first // MINUTE_MS) * MINUTE_MS, end)
-                db.execute("COMMIT")
-            finally:
-                db.close()
+        with self._opened(), self._write_lock, self._writing() as db:
+            db.execute("BEGIN")
+            if sessions:
+                db.executemany(
+                    "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [_session_row(s) for s in sessions],
+                )
+            if rows:
+                db.executemany("INSERT OR REPLACE INTO samples (t_ms, x, y, z) VALUES (?, ?, ?, ?)", rows)
+                watermark = _watermark(db)
+                first = min(row[0] for row in rows)
+                if watermark is not None and first < watermark:
+                    last = max(row[0] for row in rows)
+                    end = min(watermark, (last // MINUTE_MS + 1) * MINUTE_MS)
+                    _summarise(db, (first // MINUTE_MS) * MINUTE_MS, end)
+            db.execute("COMMIT")
 
     def start_session(
         self,
@@ -343,22 +442,18 @@ class Storage:
         now_ms = int(self._clock() * 1000) if now_ms is None else now_ms
         complete = now_ms - grace_ms if pending_from_ms is None else min(now_ms - grace_ms, pending_from_ms)
         end = (complete // MINUTE_MS) * MINUTE_MS
-        with self._opened(), self._write_lock:
-            db = self._connect()
-            try:
-                start = _watermark(db)
-                if start is None:
-                    first = db.execute("SELECT MIN(t_ms) FROM samples").fetchone()[0]
-                    start = (first // MINUTE_MS) * MINUTE_MS if first is not None else end
-                if end <= start:
-                    return 0
-                db.execute("BEGIN")
-                written = _summarise(db, start, end)
-                db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('rollup_watermark', ?)", (str(end),))
-                db.execute("COMMIT")
-                return written
-            finally:
-                db.close()
+        with self._opened(), self._write_lock, self._writing() as db:
+            start = _watermark(db)
+            if start is None:
+                first = db.execute("SELECT MIN(t_ms) FROM samples").fetchone()[0]
+                start = (first // MINUTE_MS) * MINUTE_MS if first is not None else end
+            if end <= start:
+                return 0
+            db.execute("BEGIN")
+            written = _summarise(db, start, end)
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('rollup_watermark', ?)", (str(end),))
+            db.execute("COMMIT")
+            return written
 
     def summarise_range(self, start_ms: int, end_ms: int) -> int:
         """(Re)build the minute summaries for a range, whatever the watermark.
@@ -366,43 +461,43 @@ class Storage:
         For history written behind the live edge, such as a backfill.
         """
         start = (start_ms // MINUTE_MS) * MINUTE_MS
-        with self._opened(), self._write_lock:
-            db = self._connect()
-            try:
-                db.execute("BEGIN")
-                written = _summarise(db, start, end_ms)
-                db.execute("COMMIT")
-                return written
-            finally:
-                db.close()
+        with self._opened(), self._write_lock, self._writing() as db:
+            db.execute("BEGIN")
+            written = _summarise(db, start, end_ms)
+            db.execute("COMMIT")
+            return written
 
     def prune(self, now_ms: int | None = None) -> dict:
-        """Apply retention, then the size cap. Returns what was removed."""
+        """Apply retention, then the size cap. Returns what was removed, and
+        ``deferred`` when the cap could not finish: a reader holding an old
+        snapshot kept the WAL from being emptied between its steps."""
         now_ms = int(self._clock() * 1000) if now_ms is None else now_ms
         removed = {"samples": 0, "minutes": 0, "size_capped": False}
-        with self._opened(), self._write_lock:
-            db = self._connect()
-            try:
-                removed["samples"] += db.execute(
-                    "DELETE FROM samples WHERE t_ms < ?", (now_ms - self.raw_retention_ms,)
-                ).rowcount
-                removed["minutes"] += db.execute(
-                    "DELETE FROM minutes WHERE t_ms < ?", (now_ms - self.rollup_retention_ms,)
-                ).rowcount
-                if _data_bytes(db) > self.max_bytes:
-                    removed["size_capped"] = True
-                    self._cap(db, removed)
-                    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('size_capped_ms', ?)", (str(now_ms),))
-                self._reclaim(db)
-            finally:
-                db.close()
+        with self._opened(), self._write_lock, self._writing() as db:
+            removed["samples"] += db.execute(
+                "DELETE FROM samples WHERE t_ms < ?", (now_ms - self.raw_retention_ms,)
+            ).rowcount
+            removed["minutes"] += db.execute(
+                "DELETE FROM minutes WHERE t_ms < ?", (now_ms - self.rollup_retention_ms,)
+            ).rowcount
+            if _data_bytes(db) > self.max_bytes:
+                removed["size_capped"] = True
+                self._cap(db, removed)
+                db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('size_capped_ms', ?)", (str(now_ms),))
+            _reclaim(db)
         return removed
 
     def _cap(self, db: sqlite3.Connection, removed: dict) -> None:
         """Delete the oldest data until they fit in 90 % of the cap, in the
         order the module docstring gives. Each step deletes about what the
-        excess needs and the next measures again, so the cap takes what it
-        must and at most a step more."""
+        excess needs, a megabyte at most, and the next measures again, so the
+        cap takes what it must and at most a step more.
+
+        A step's deletions sit in the WAL until a checkpoint takes them into
+        the file. While a reader holds an old snapshot none can, and steps
+        would pile up in the WAL, the disk filling as the data shrink: the
+        rest then waits for a prune that finds no such reader (``deferred``).
+        """
         target = int(self.max_bytes * 0.9)
         summarised = _watermark(db)
         minutes = db.execute("SELECT COUNT(*) FROM minutes").fetchone()[0]
@@ -427,15 +522,9 @@ class Storage:
                 removed["samples"] += deleted
             else:
                 break
-
-    def _reclaim(self, db: sqlite3.Connection) -> None:
-        # Both pragmas do their work as the statement is stepped, so the rows
-        # must be fetched: execute() alone steps once, and incremental_vacuum
-        # frees one page per step — without fetchall it frees almost nothing.
-        db.execute("PRAGMA incremental_vacuum").fetchall()
-        db.execute(f"PRAGMA busy_timeout = {CHECKPOINT_WAIT_MS}")
-        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        db.execute("PRAGMA busy_timeout = 10000")
+            if _data_bytes(db) > target and not _checkpoint(db):
+                removed["deferred"] = True
+                break
 
     def _file_bytes(self) -> int:
         total = 0
@@ -508,7 +597,7 @@ class Storage:
             finally:
                 db.close()
 
-    def series(self, start_ms: int, end_ms: int, max_points: int = 1500) -> dict:
+    def series(self, start_ms: int, end_ms: int, max_points: int = 1500, since_ms: int | None = None) -> dict:
         """What a chart of [start, end] needs, in at most ~max_points points.
 
         Raw samples when they fit; otherwise buckets of equal width with the
@@ -516,14 +605,17 @@ class Storage:
         samples when buckets are shorter than a minute and from the minute
         summaries when they are longer. Min and max travel with every bucket
         because a spike averaged into a long bucket would otherwise vanish.
-        Buckets sit on a grid of their own width (see ``series.py``).
+        Buckets sit on a grid of their own width (see ``series.py``), so with
+        ``since_ms`` only the buckets from the one it falls in on are worked
+        out: what a client holding an earlier answer lacks. (Raw samples are
+        few, and come whole; the caller takes their tail.)
         """
         max_points = shape.clamp_points(max_points)
         bucket = shape.bucket_width(start_ms, end_ms, max_points)
         with self._opened():
-            return self._series(start_ms, end_ms, max_points, bucket)
+            return self._series(start_ms, end_ms, max_points, bucket, since_ms)
 
-    def _series(self, start_ms: int, end_ms: int, max_points: int, bucket: int) -> dict:
+    def _series(self, start_ms: int, end_ms: int, max_points: int, bucket: int, since_ms: int | None) -> dict:
         db = self._connect()
         try:
             if bucket >= MINUTE_MS:
@@ -538,7 +630,7 @@ class Storage:
                     FROM minutes WHERE t_ms >= ? AND t_ms < ?
                     GROUP BY k ORDER BY k
                     """,
-                    (bucket, start_ms, end_ms),
+                    (bucket, shape.bucketed_from(start_ms, bucket, since_ms), end_ms),
                 ).fetchall()
                 return shape.bucketed_points(rows, bucket, "minutes")
             count = db.execute(
@@ -550,37 +642,59 @@ class Storage:
                 ).fetchall()
                 return shape.raw_points(raw, "samples")
             rows = db.execute(
-                """
+                f"""
                 SELECT t_ms / ? AS k, MIN(t_ms), COUNT(*),
                        MIN(x), AVG(x), MAX(x),
                        MIN(y), AVG(y), MAX(y),
                        MIN(z), AVG(z), MAX(z),
-                       MIN(magnitude(x, y, z)), AVG(magnitude(x, y, z)), MAX(magnitude(x, y, z))
-                FROM samples WHERE t_ms >= ? AND t_ms < ?
-                GROUP BY k ORDER BY k
-                """,
-                (bucket, start_ms, end_ms),
+                       MIN(b), AVG(b), MAX(b)
+                FROM ({_WITH_MAGNITUDE}) GROUP BY k ORDER BY k
+                """,  # noqa: S608 - a fixed fragment
+                (bucket, shape.bucketed_from(start_ms, bucket, since_ms), end_ms),
             ).fetchall()
             return shape.bucketed_points(rows, bucket, "samples")
         finally:
             db.close()
 
 
+# The samples in [?, ?), each with its |B| worked out once. The LIMIT is
+# there to stop SQLite flattening the subquery into the aggregate that reads
+# it (its rule 9: a subquery with a LIMIT is not flattened into an aggregate),
+# which would call magnitude() once for each of MIN, AVG and MAX.
+_WITH_MAGNITUDE = "SELECT t_ms, x, y, z, magnitude(x, y, z) AS b FROM samples WHERE t_ms >= ? AND t_ms < ? LIMIT -1"
+
+
 def _summarise(db: sqlite3.Connection, start: int, end: int) -> int:
     cursor = db.execute(
-        """
+        f"""
         INSERT OR REPLACE INTO minutes
         SELECT (t_ms / 60000) * 60000, COUNT(*),
                MIN(x), AVG(x), MAX(x),
                MIN(y), AVG(y), MAX(y),
                MIN(z), AVG(z), MAX(z),
                MIN(b), AVG(b), MAX(b)
-        FROM (SELECT t_ms, x, y, z, magnitude(x, y, z) AS b FROM samples WHERE t_ms >= ? AND t_ms < ?)
+        FROM ({_WITH_MAGNITUDE})
         GROUP BY t_ms / 60000
-        """,
+        """,  # noqa: S608 - a fixed fragment
         (start, end),
     )
     return cursor.rowcount
+
+
+def _reclaim(db: sqlite3.Connection) -> None:
+    """Hand the free pages back to the filesystem, and truncate the WAL.
+
+    A chunk at a time, each checkpointed before the next: moving a page
+    writes it to the WAL, which only a checkpoint empties. And not at all
+    while a checkpoint cannot complete, because a reader holds an old
+    snapshot: the WAL could not be emptied, and would grow by every page
+    moved. The free pages then stay in the file, which new writes reuse, and
+    the next prune tries again.
+    """
+    while _checkpoint(db) and db.execute("PRAGMA freelist_count").fetchone()[0]:
+        # The pragma does its work as the statement is stepped, a page a step,
+        # so the rows must be fetched: execute() alone frees almost nothing.
+        db.execute(f"PRAGMA incremental_vacuum({RECLAIM_CHUNK_PAGES})").fetchall()
 
 
 def _watermark(db: sqlite3.Connection) -> int | None:
@@ -598,6 +712,15 @@ def _gone(exc: sqlite3.Error) -> bool:
         or code == sqlite3.SQLITE_READONLY_DBMOVED
         or str(exc).startswith("no such table")
     )
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    """Which file a path names, as (device, inode), or None if none."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino)
 
 
 def _header_version(path: Path) -> int | None:
@@ -635,8 +758,18 @@ def _data_bytes(db: sqlite3.Connection) -> int:
     return (pages - free) * size
 
 
-def _step(excess_bytes: int, row_bytes: int) -> int:
-    return max(CAP_STEP_MIN_ROWS, min(CAP_STEP_MAX_ROWS, math.ceil(excess_bytes / row_bytes)))
+def _step(excess_bytes: int, row_bytes: float) -> int:
+    return max(CAP_STEP_MIN_ROWS, math.ceil(min(excess_bytes, CAP_STEP_MAX_BYTES) / row_bytes))
+
+
+def _checkpoint(db: sqlite3.Connection) -> bool:
+    """Checkpoint and truncate the WAL, waiting a little for readers. Whether
+    it completed: not while a reader holds an old snapshot."""
+    db.execute(f"PRAGMA busy_timeout = {CHECKPOINT_WAIT_MS}")
+    try:
+        return not db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+    finally:
+        db.execute("PRAGMA busy_timeout = 10000")
 
 
 def _delete_oldest(db: sqlite3.Connection, table: str, rows: int, before: int | None = None) -> int:
