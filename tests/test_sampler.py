@@ -624,7 +624,7 @@ def magnitudes(rig):
 def test_a_brown_out_never_reaches_storage_at_the_wrong_gain(mode, rate, cycle_count):
     # A brown-out puts the chip back to 200 cycles without a single transfer
     # failing. Poll mode goes on measuring, at half the gain at 400 cycles and
-    # a fifth at 1000, and the end-to-end review stored 27 s of |B| at 24,556
+    # a fifth at 1000, and an end-to-end run stored 27 s of |B| at 24,556
     # nT that way. Nothing measured after a reset may be delivered: the field
     # here is ~48,600 nT throughout.
     rig = Rig(

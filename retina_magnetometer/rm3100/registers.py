@@ -73,7 +73,8 @@ BIST_START = 0x8F
 DEFAULT_CYCLE_COUNT = 200
 # The register holds 0..65535. Below ~30 the result is quantisation-limited and
 # above ~400 noise stops improving much (p.30); the app accepts a range that
-# covers every documented and field-used value (HamSCI 400, Regoli et al. 800).
+# covers every documented and field-used value (HamSCI's runMag defaults to
+# 200; Regoli et al. 2018 ran at 800).
 MIN_CYCLE_COUNT = 30
 MAX_CYCLE_COUNT = 1000
 

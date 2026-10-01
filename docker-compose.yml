@@ -2,13 +2,15 @@
 # RM3100 simulator, at http://localhost:3030.
 #
 #   docker compose up --build              # live data from the demo scenario
-#   docker compose run --rm backfill       # optional: add a week of history first
+#   docker compose run --rm backfill       # optional: a week of history before what is stored
 #   SIM_SCENARIO=faults docker compose up  # any scenario: list with
 #                                          #   docker compose run --rm rm3100-sim rm3100_sim list
 #
-# The app here is configured exactly as on a node except for the bus: a node
-# sets MAGNETOMETER_BUS=/dev/i2c-1 (see deploy/retina-node-service.yml), this
-# file points it at the simulator. No code differs.
+# The app here is configured as on a node except for the bus and the location:
+# a node sets MAGNETOMETER_BUS=/dev/i2c-1 and reads its position from
+# retina-node's config.yml (see deploy/retina-node-service.yml); this file
+# points the app at the simulator and says where the simulated site is. No
+# code differs.
 name: retina-magnetometer-demo
 
 services:
@@ -37,9 +39,12 @@ services:
       - magnetometer-data:/data
     restart: unless-stopped
 
-  # One-shot: seven days of simulated history ending now, written straight
-  # into the app's database, so the 7-day view has something to show on a
-  # fresh install. Safe while the app runs.
+  # One-shot: seven days of simulated history, written straight into the app's
+  # database so the 7-day view has something to show on a fresh install. It
+  # ends where the stored history begins (its oldest sample or minute summary;
+  # now, on a fresh install), overwrites nothing and only writes: the app's
+  # retention and size cap apply to it on the app's next pass. Safe while the
+  # app runs.
   backfill:
     image: retina-magnetometer:dev
     profiles: ["tools"]

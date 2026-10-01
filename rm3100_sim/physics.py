@@ -415,8 +415,8 @@ class SqModel:
     interpolated between local noons so that no day boundary shows a jump —
     the day-to-day spread measured at FRD and BSL is ±25–40 %.
 
-    The fit is for ~35–40° N in North America. Elsewhere it is a plausible
-    shape, not a prediction.
+    The fit is for eastern North America between BSL (30.4° N) and FRD
+    (38.2° N). Elsewhere it is a plausible shape, not a prediction.
     """
 
     longitude: float

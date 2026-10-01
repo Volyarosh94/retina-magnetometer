@@ -27,11 +27,16 @@ getting right before it is screwed down:
 - **Supply**: 2.0–3.6 V. The Pi's 3.3 V rail, never 5 V (ArduPilot users saw a
   ~1.3x gain error from boards run above the 3.7 V absolute maximum).
 - **Address**: 0x20–0x23 by strapping; the app probes all four.
-- **Distance**: the field of a steel box, a fan or a DC cable falls as 1/r³,
-  but next to the Pi, the SDR and the power supply it can be hundreds of nT.
-  Mount the sensor as far from them as the cable allows (HamSCI stations run
-  30 m of differential I2C to put it in the garden) and away from anything
-  that moves or switches.
+- **Distance**: a steel box or a fan motor is a small magnet whose field
+  falls as 1/r³, so a few metres usually settle it. A cable does not: one
+  conductor carrying 1 A puts 200 nT on the sensor at a metre and still 40 nT
+  at five, falling only as 1/r. Its return beside it cancels most of that (a
+  pair falls as 1/r², a twisted pair much faster), so power should run as a
+  twisted pair with its own return, never back through the mast or the
+  ground. Next to the Pi, the SDR and the power supply the total can be
+  hundreds of nT, and it moves as their load does. Mount the sensor as far
+  from them as the cable allows (HamSCI stations run 30 m of differential I2C
+  to put it in the garden) and away from anything that moves or switches.
 - **Orientation**: level, with a known axis pointing north if possible. The app
   works out the downward axis and the heading anyway, but a documented mounting
   makes that a check rather than a discovery.
@@ -53,7 +58,8 @@ service there follows the precedent of retina-telemetry and retina-spectrum:
 5. Release as usual: tag this repository `vX.Y.Z` to publish
    `ghcr.io/offworldlabs/retina-magnetometer:vX.Y.Z` (arm64 and amd64), bump
    the pin in retina-node, tag retina-node, and Mender carries the image to the
-   nodes inside the artifact.
+   nodes inside the artifact. The repository has to be in offworldlabs first:
+   see [where the image comes from](#where-the-image-comes-from).
 
 The choices in that entry, and why:
 
@@ -112,11 +118,26 @@ the manifests `.env` on every run, so values set there by hand do not survive;
 until config-merger emits them, the defaults in the compose entry are what a
 node runs, the same limitation retina-telemetry's DNS settings have.
 
+### Where the image comes from
+
+The entry pulls `ghcr.io/offworldlabs/retina-magnetometer`. The release
+workflow, `.github/workflows/release.yml`, publishes to
+`ghcr.io/<owner of the repository>/retina-magnetometer`, so the two meet only
+once the retina-magnetometer repository lives in offworldlabs: transferred
+there, or forked into it, before the first release. A tag pushed from any
+other account publishes under that account, where no node looks.
+
+A release runs every gate first (`tools/check.sh`, as CI does), refuses a tag
+that does not match the version in `pyproject.toml`, and publishes the tag and
+`latest` for arm64 and amd64. Each image carries labels naming the repository,
+the commit and the tag that built it.
+
 ## 4. Checking it on the node
 
 ```bash
 ls -l /dev/i2c-1                     # the bus exists (after the owl-os change)
 i2cdetect -y 1                       # something at 0x20-0x23 (i2c-tools)
+chronyc tracking                     # "Leap status : Normal": the clock is synchronised
 docker logs retina-magnetometer      # "RM3100 at 0x20 on /dev/i2c-1 ..."
 curl -s localhost:3030/api/health | jq '.state, .sensor, .self_test'
 cat /data/retina-node/retina-magnetometer/status.json
@@ -124,7 +145,9 @@ docker exec retina-magnetometer ls -A /dev/shm /dev/mqueue   # both empty
 docker exec retina-magnetometer ls -l /dev/console           # 1, 3: the null device
 ```
 
-Then open `http://<node>:3030`. The first power-up of a new sensor is worth the
+The clock matters because retention runs on it: a node whose clock is days
+ahead deletes history early (item 22 of the checklist says how much). Then
+open `http://<node>:3030`. The first power-up of a new sensor is worth the
 full checklist in [hardware-verification.md](hardware-verification.md).
 
 ## 5. Optional follow-ups elsewhere

@@ -42,7 +42,10 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $declared"; exit 1
           fi
 
-      # GHCR names must be lower case; a fork publishes under its own owner.
+      # GHCR names must be lower case. The image goes to the registry of the
+      # account that owns this repository: ghcr.io/offworldlabs/... only once
+      # the repository lives in offworldlabs, and a fork publishes under its
+      # own owner.
       - id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/retina-magnetometer" >> "$GITHUB_OUTPUT"
 
@@ -62,5 +65,12 @@ jobs:
           tags: |
             ${{ steps.image.outputs.name }}:${{ github.ref_name }}
             ${{ steps.image.outputs.name }}:latest
+          # The repository, commit and tag that built the image, so it names
+          # where it came from wherever it is published. The Dockerfile keeps
+          # the title and description.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

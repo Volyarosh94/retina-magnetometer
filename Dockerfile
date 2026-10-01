@@ -14,9 +14,12 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 FROM python:3.12-slim
 
+# Where an image comes from (source, revision, version) is labelled when it is
+# built for a release (.github/workflows/release.yml), from the repository and
+# the tag that built it, so that it can never name a repository it did not
+# come from.
 LABEL org.opencontainers.image.title="retina-magnetometer" \
-      org.opencontainers.image.description="RM3100 magnetometer app for RETINA nodes, with a register-level RM3100 simulator" \
-      org.opencontainers.image.source="https://github.com/offworldlabs/retina-magnetometer"
+      org.opencontainers.image.description="RM3100 magnetometer app for RETINA nodes, with a register-level RM3100 simulator"
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_PYTHON_DOWNLOADS=never \

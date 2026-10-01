@@ -24,7 +24,7 @@ data's (the pages in use), not the file's: a reader holding an old snapshot
 keeps the WAL from being checkpointed, and deleting more rows could not
 shrink it. What the cap bounds, then, is the data. The file follows at the
 next prune that finds no reader holding an old snapshot: freed pages go back
-to the filesystem then, a megabyte at a time with a checkpoint after each, so
+to the filesystem then, four megabytes at a time with a checkpoint after each, so
 that reclaiming never needs much more room than it frees, and the WAL is
 truncated. Until then the freed pages stay inside the file, where new writes
 reuse them, so the file does not grow either.

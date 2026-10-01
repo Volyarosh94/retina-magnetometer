@@ -149,7 +149,7 @@ North/east/down (NED), in nanotesla, summed from independent sources:
 
 | Source | Model | Size at Greenville, SC |
 | --- | --- | --- |
-| Main field | **WMM2025** at the site's latitude, longitude and altitude, evaluated hourly and interpolated (pygeomag, which ships NOAA's coefficient file unchanged and reproduces all 100 official test values) | X 22,398, Y −2,761, Z 43,002 nT; \|B\| 48,564 nT; dip 62.3°, declination −7.0° |
+| Main field | **WMM2025** at the site's latitude, longitude and altitude, evaluated hourly and interpolated (pygeomag, which ships NOAA's coefficient file unchanged and reproduces all 100 official test values) | X 22,398, Y −2,761, Z 43,002 nT; \|B\| 48,564 nT; dip 62.3°, declination −7.0° (300 m up, on 30 September 2026) |
 | Crust | A fixed offset per scenario: the WMM describes the core field only, and local crust moves a real site by tens to ~100 nT | 42, −18, 65 nT in the built-ins |
 | Daily variation | The solar-quiet (Sq) variation: four solar harmonics (24, 12, 8, 6 h) in local time, fitted to quiet days at the INTERMAGNET observatories either side of Greenville (FRD and BSL), for solar minimum and maximum and three seasons, blended by date and by F10.7. Each local day gets its own amplitude factor and phase shift, interpolated between local noons | 20–90 nT peak to peak, largest in Y, X lowest near local noon |
 | Storms | A sudden commencement, a main phase pulling X towards 0.72·Dst, an exponential recovery, and Pc4–Pc5 pulsations (45–600 s) on the main phase | as configured; `storm` uses Dst −250 nT |
@@ -169,11 +169,16 @@ drawn once per pass from the seed unless the scenario fixes it (`along_track`,
 or a vector), and stays fixed for the pass. For speed, each pass and each
 storm is evaluated only while it can contribute more than 0.001 nT.
 
-What this model is not: the Sq fit is for about 35–40° N in North America and
-is a plausible shape elsewhere, not a prediction; storms are shaped to stress
-detectors, not to forecast; there is no induced (as opposed to permanent)
-magnetisation, no temperature drift (the RM3100 has no temperature sensor and
-its coil tempco is 0.4 %/°C), and no 1/f sensor noise.
+What this model is not: the Sq fit is to FRD (38.2° N) and BSL (30.4° N), so
+it stands for roughly 30–38° N in eastern North America and is a plausible
+shape elsewhere, not a prediction; storms are shaped to stress detectors, not
+to forecast; there is no induced (as opposed to permanent) magnetisation, no
+1/f sensor noise, and no temperature dependence. PNI calls the measurements
+stable over temperature and free from offset drift (UM16 §2), and the
+0.4 %/°C in the manual's Table 3-3 is the coils' DC resistance, not a drift of
+the reading; the chip has no temperature sensor, and how a sensor on a mast
+behaves is for the [hardware checklist](../docs/hardware-verification.md)
+(item 15) to find out.
 
 ## Scenario files
 
