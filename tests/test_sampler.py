@@ -128,16 +128,18 @@ class HundredKilohertzBus(ModelBus):
     address and a repeated start included), as a chip whose conversion takes
     ``slower`` times Table 3-1's: DRDY reads low until then."""
 
-    def __init__(self, model, clock, cycle_count, slower=1.0):
+    def __init__(self, model, clock, cycle_count, slower=1.0, host_s=0.0):
         super().__init__(model)
         self.clock = clock
         self.conversion = reg.xyz_conversion_s(cycle_count) * slower
+        self.host_s = host_s  # the host's own share of each measurement
         self.polled_at = None
 
     def transfer(self, address, write, read_length=0):
         size = 1 + len(write) + (1 + read_length if read_length else 0)
         self.clock.advance(size * 9 / 100_000)
         if write[:1] == b"\x00" and write[1:2] not in (b"", b"\x00"):
+            self.clock.advance(self.host_s)
             self.polled_at = self.clock.now
         reply = super().transfer(address, write, read_length)
         if write == b"\x34" and self.polled_at is not None and self.clock.now - self.polled_at < self.conversion:
@@ -198,12 +200,14 @@ def test_continuous_mode_delivers_at_the_tmrc_rate():
     rig = Rig(MODE="continuous", SAMPLE_RATE_HZ=37)
     rig.run(4)
     assert rig.model.continuous
+    rig.sampler.stop()  # delivers what still waits for a read-back
     assert len(rig.samples) == pytest.approx(4 * 37.5, abs=3)
 
 
 def test_poll_mode_that_keeps_up_reports_the_configured_rate():
     rig = Rig(SAMPLE_RATE_HZ=80)
     rig.run(3)
+    rig.sampler.stop()
     snap = rig.health.snapshot()
     assert len(rig.samples) == pytest.approx(240, abs=2)
     assert snap["effective_rate_hz"] == 80.0 and snap["state"] == "ok"
@@ -219,18 +223,12 @@ def test_poll_mode_keeps_its_limit_with_a_slower_chip_on_a_100_khz_bus(cycle_cou
     rig = Rig(SAMPLE_RATE_HZ=f"{rate!r}", CYCLE_COUNT=cycle_count)
     assert rig.config.warnings == ()
     rig.sampler._open_bus = lambda spec, repeated_start=True: HundredKilohertzBus(
-        rig.model, rig.clock, cycle_count, slower=1.05
+        rig.model, rig.clock, cycle_count, slower=1.05, host_s=0.001
     )
-
-    def on_sample(*sample):
-        rig.samples.append(sample)
-        rig.clock.advance(0.001)
-
-    rig.sampler.on_sample = on_sample
-    rig.run(2)
-    first, began = len(rig.samples), rig.clock.now
-    rig.run(10)
-    delivered = (len(rig.samples) - first) / (rig.clock.now - began)
+    rig.run(12)
+    rig.sampler.stop()
+    window = [t for t, *_ in rig.samples if (START + 2) * 1000 <= t < (START + 12) * 1000]
+    delivered = len(window) / 10
     snap = rig.health.snapshot()
     assert delivered == pytest.approx(rate, rel=0.01)
     assert snap["state"] == "ok" and snap["effective_rate_hz"] == pytest.approx(rate)
@@ -243,6 +241,7 @@ def test_a_poll_rate_above_the_limit_runs_at_the_limit_and_says_so():
     rig = Rig(SAMPLE_RATE_HZ=120)
     assert rig.config.errors == () and rig.config.sample_rate_hz == limit
     rig.run(3)
+    rig.sampler.stop()
     snap = rig.health.snapshot()
     assert len(rig.samples) == pytest.approx(3 * limit, abs=2)
     assert snap["state"] == "degraded"
@@ -259,6 +258,7 @@ def test_poll_mode_that_cannot_keep_up_says_so():
     rig = Rig(config=Config(sample_rate_hz=140.0))
     rig.sampler._open_bus = lambda spec, repeated_start=True: SlowModelBus(rig.model, rig.clock, 0.001)
     rig.run(3)
+    rig.sampler.stop()
     snap = rig.health.snapshot()
     assert len(rig.samples) == pytest.approx(3 * 70, rel=0.05)
     assert snap["effective_rate_hz"] == pytest.approx(70, rel=0.05)
@@ -295,6 +295,10 @@ def test_acquisition_stops_continuous_mode_before_anything_needs_a_poll(mode):
     )
     if mode == "continuous":
         bus.expect(a, b"\x01\x00").expect(a, b"\x0b\x9b").expect(a, b"\x01\x79")
+        bus.expect(a, b"\x0b", 1, b"\x9b")  # TMRC as set, for the read-backs (reading it ends nothing)
+    else:
+        bus.expect(a, b"\x0b\x9f")  # TMRC, unused in poll mode, set to what no reset leaves
+        bus.expect(a, b"\x0b", 1, b"\x9f")
     rig.sampler._open_bus = lambda spec, repeated_start=True: bus
     assert rig.sampler._acquire()
     bus.assert_done()
@@ -551,15 +555,23 @@ def test_a_silent_reset_is_noticed_and_recovered_from(mode, cycle_count, noticed
     assert len(rig.samples_after(reset_at + 15)) >= 50
 
 
-def test_a_silent_reset_at_the_defaults_costs_poll_mode_nothing():
+def test_a_silent_reset_at_the_defaults_is_noticed_too():
+    # At 200 cycles the counts read the same after a reset, but TMRC, which
+    # poll mode sets to a value no reset leaves, does not: the sample that
+    # may have been read from reset registers is dropped, and the chip set up
+    # again.
     rig = Rig()
     rig.run(5)
     rig.model._power_on_reset()
     reset_at = rig.clock.now
     rig.run(30)
     snap = rig.health.snapshot()
-    assert snap["read_errors_total"] == 0 and snap["reinitialisations"] == 0
-    assert len(rig.samples_after(reset_at)) >= 29
+    (reset,) = [e for e in snap["recent_errors"] if e["kind"] == "sensor reset"]
+    assert "TMRC read 0x96, expected 0x9F" in reset["message"]
+    assert "1 sample measured since the last good read-back dropped" in reset["message"]
+    assert snap["reinitialisations"] == 1 and snap["state"] == "ok"
+    assert len(rig.samples_after(reset_at)) >= 28
+    assert rig.model.tmrc == 0x9F
 
 
 def test_a_failed_sample_is_not_counted_as_missed_ticks():
@@ -581,6 +593,7 @@ def test_a_wall_clock_step_is_not_taken_for_missed_ticks(step_s):
     rig.run(2)
     rig.wall_offset += step_s
     rig.run(3)
+    rig.sampler.stop()
     snap = rig.health.snapshot()
     assert snap["effective_rate_hz"] == 10.0 and snap["state"] == "ok"
     assert len(rig.samples) >= 49
@@ -600,6 +613,193 @@ def test_continuous_mode_ended_by_another_program_is_started_again():
     snap = rig.health.snapshot()
     assert snap["reinitialisations"] == 1 and snap["state"] == "ok"
     assert any(e["kind"] == "timeout" and "continuous mode" in e["message"] for e in snap["recent_errors"])
+
+
+def magnitudes(rig):
+    return [(x * x + y * y + z * z) ** 0.5 for _, x, y, z in rig.samples]
+
+
+@pytest.mark.parametrize("cycle_count", [400, 1000])
+@pytest.mark.parametrize("mode,rate", [("poll", 1), ("poll", 10), ("continuous", 10)])
+def test_a_brown_out_never_reaches_storage_at_the_wrong_gain(mode, rate, cycle_count):
+    # A brown-out puts the chip back to 200 cycles without a single transfer
+    # failing. Poll mode goes on measuring, at half the gain at 400 cycles and
+    # a fifth at 1000, and the end-to-end review stored 27 s of |B| at 24,556
+    # nT that way. Nothing measured after a reset may be delivered: the field
+    # here is ~48,600 nT throughout.
+    rig = Rig(
+        {"faults": [{"type": "brownout", "at": "+5.55s"}]}, MODE=mode, SAMPLE_RATE_HZ=rate, CYCLE_COUNT=cycle_count
+    )
+    rig.run(20)
+    rig.sampler.stop()
+    assert rig.model.stats.power_cycles == 1
+    b = magnitudes(rig)
+    assert min(b) > 47_000 and max(b) < 50_500
+    snap = rig.health.snapshot()
+    if mode == "poll":
+        (reset,) = [e for e in snap["recent_errors"] if e["kind"] == "sensor reset"]
+        assert "dropped" in reset["message"]
+    # Sampling went on, at the configured gain again.
+    assert rig.model.cycle_counts == [cycle_count] * 3
+    assert len(rig.samples_after(START + 10)) >= 9 * rate
+
+
+@pytest.mark.parametrize(
+    "cycle_count,rate",
+    [
+        (200, 37),  # every register the app sets is at its reset value: only a later DRDY tells
+        (200, 10),
+        (400, 10),
+        (1000, 10),
+    ],
+)
+def test_a_reset_between_drdy_and_the_results_is_not_delivered(cycle_count, rate):
+    # In continuous mode a brown-out stops the chip measuring, which the
+    # watchdog notices; but one that lands after the STATUS read that saw
+    # DRDY and before the results are read hands over the reset registers:
+    # a sample of zeros (UM16 Table 5-1). At 200 cycles and TMRC 0x96 (37.5 Hz)
+    # nothing the app can read back differs from a reset chip, and CMM cannot
+    # be read without ending continuous mode.
+    rig = Rig(MODE="continuous", SAMPLE_RATE_HZ=rate, CYCLE_COUNT=cycle_count)
+    armed = []
+
+    class ResetAfterDrdy(ModelBus):
+        def transfer(self, address, write, read_length=0):
+            reply = super().transfer(address, write, read_length)
+            if armed and write == b"\x34" and reply[0] & 0x80:
+                armed.clear()
+                rig.model._power_on_reset()
+            return reply
+
+    rig.sampler._open_bus = lambda spec, repeated_start=True: ResetAfterDrdy(rig.model)
+    rig.run(3)
+    armed.append(True)
+    rig.run(10)
+    rig.sampler.stop()
+    assert not armed  # it happened
+    b = magnitudes(rig)
+    assert min(b) > 47_000 and max(b) < 50_500
+    assert rig.model.continuous is False and len(rig.samples_after(START + 6)) >= 5 * rate
+
+
+@pytest.mark.parametrize("cycle_count", [200, 400])
+def test_a_reset_between_drdy_and_the_results_in_poll_mode_is_not_delivered(cycle_count):
+    # The same window in poll mode: the measurement is done, STATUS says so,
+    # and the chip resets before its results are read. At the default 200
+    # cycles the counts read back the same either way.
+    rig = Rig(SAMPLE_RATE_HZ=1, CYCLE_COUNT=cycle_count)
+    armed = []
+
+    class ResetAfterDrdy(ModelBus):
+        def transfer(self, address, write, read_length=0):
+            reply = super().transfer(address, write, read_length)
+            if armed and write == b"\x34" and reply[0] & 0x80:
+                armed.clear()
+                rig.model._power_on_reset()
+            return reply
+
+    rig.sampler._open_bus = lambda spec, repeated_start=True: ResetAfterDrdy(rig.model)
+    rig.run(3)
+    armed.append(True)
+    rig.run(10)
+    rig.sampler.stop()
+    assert not armed
+    b = magnitudes(rig)
+    assert min(b) > 47_000 and max(b) < 50_500
+    (reset,) = [e for e in rig.health.snapshot()["recent_errors"] if e["kind"] == "sensor reset"]
+    assert "1 sample measured since the last good read-back dropped" in reset["message"]
+    assert len(rig.samples) >= 11
+
+
+def test_a_read_back_that_fails_keeps_its_samples_for_the_next():
+    rig = Rig(SAMPLE_RATE_HZ=10, CYCLE_COUNT=400)
+    fail = []
+
+    class FailingReadBack(ModelBus):
+        def transfer(self, address, write, read_length=0):
+            if fail and write == b"\x04" and read_length == 6:
+                fail.clear()
+                raise nack()
+            return super().transfer(address, write, read_length)
+
+    rig.sampler._open_bus = lambda spec, repeated_start=True: FailingReadBack(rig.model)
+    rig.run(2)
+    fail.append(True)
+    rig.run(3)
+    rig.sampler.stop()
+    assert not fail
+    stamps = [s[0] for s in rig.samples]
+    # Every tick from the first sample to the last, once: those held across
+    # the failed read-back went out with the next one.
+    assert stamps == sorted(set(stamps))
+    assert len(stamps) == round((stamps[-1] - stamps[0]) / 100) + 1 >= 49
+    assert rig.health.snapshot()["read_errors_total"] == 1
+
+
+def test_a_clean_stop_delivers_what_is_held():
+    # Nothing measured is lost on a clean stop: it is read back and delivered.
+    rig = Rig(SAMPLE_RATE_HZ=10, CYCLE_COUNT=400)
+    rig.run(1.55)
+    rig.sampler.stop()
+    stamps = [s[0] for s in rig.samples]
+    assert stamps[-1] > (START + 1.5) * 1000
+    assert len(stamps) == round((stamps[-1] - stamps[0]) / 100) + 1
+
+
+@pytest.mark.parametrize("rate", [10, 37])
+def test_a_clean_stop_in_continuous_mode_delivers_every_sample_read(rate):
+    # The newest sample waits for a DRDY after it; at a clean stop the app
+    # waits for that one DRDY rather than lose the sample.
+    rig = Rig(MODE="continuous", SAMPLE_RATE_HZ=rate)
+    reads = []
+
+    class CountingResults(ModelBus):
+        def transfer(self, address, write, read_length=0):
+            if write == b"\x24" and read_length == 9:
+                reads.append(rig.clock.now)
+            return super().transfer(address, write, read_length)
+
+    rig.sampler._open_bus = lambda spec, repeated_start=True: CountingResults(rig.model)
+    rig.run(2.03)
+    rig.sampler.stop()
+    assert len(rig.samples) == len(reads) >= 2 * rate * 0.9
+
+
+def test_a_reset_just_before_a_clean_stop_is_not_delivered():
+    # The zero sample is the newest one held when the app stops: the DRDY
+    # that would confirm it never comes, so it is dropped, not delivered.
+    rig = Rig(MODE="continuous", SAMPLE_RATE_HZ=37)
+    armed = []
+
+    class ResetAfterDrdy(ModelBus):
+        def transfer(self, address, write, read_length=0):
+            reply = super().transfer(address, write, read_length)
+            if armed and write == b"\x34" and reply[0] & 0x80:
+                armed.clear()
+                rig.model._power_on_reset()
+            return reply
+
+    rig.sampler._open_bus = lambda spec, repeated_start=True: ResetAfterDrdy(rig.model)
+    rig.run(2)
+    armed.append(True)
+    while armed:
+        rig.sampler.step()
+    rig.sampler.stop()
+    b = magnitudes(rig)
+    assert len(b) >= 60 and min(b) > 47_000
+
+
+def test_samples_held_when_the_sensor_is_dropped_are_read_back_first():
+    # DRDY sticks halfway through a batch: the samples measured before it are
+    # still good, and a read-back as the sensor is dropped delivers them.
+    rig = Rig(
+        {"faults": [{"type": "stuck_drdy", "at": "+2.05s", "duration": "10s"}]}, SAMPLE_RATE_HZ=10, CYCLE_COUNT=400
+    )
+    rig.run(4)
+    stamps = [s[0] for s in rig.samples]
+    # The last tick before DRDY stuck, stamped mid-conversion.
+    assert stamps[-1] == pytest.approx((START + 2.0 + reg.xyz_conversion_s(400) / 2) * 1000, abs=1)
+    assert len(stamps) == round((stamps[-1] - stamps[0]) / 100) + 1
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -640,20 +840,29 @@ def test_failed_self_test_degrades_but_keeps_sampling(mode):
 # ── Failures that are not the sensor's ───────────────────────────────────────
 
 
-def test_a_failed_session_record_does_not_stop_sampling():
-    # Whatever recording a session raises, the row is lost and the samples
-    # are not; the error is on the page.
-    rig = Rig()
+def test_a_failed_session_record_does_not_stop_sampling(caplog):
+    # The recorder queues sessions and writes them with its own storage
+    # operations, so a session recorder that raises is a bug in the app: the
+    # row is lost, the samples are not, and it is an internal error, not a
+    # storage one (which would hide a real write failure, and be cleared by
+    # the recorder's next report).
+    rig = Rig({"faults": [{"type": "nack", "at": "+5s", "duration": "3s", "probability": 1.0}]})
 
-    def locked(**session):
-        raise sqlite3.OperationalError("database is locked")
+    def broken(**session):
+        raise RuntimeError("session queue broke")
 
-    rig.sampler.on_session = locked
-    rig.run(5)
-    assert len(rig.samples) == 5
+    rig.sampler.on_session = broken
+    with caplog.at_level("ERROR", logger="retina_magnetometer.sampler"):
+        rig.run(20)
+    assert len(rig.samples_after(START + 9)) >= 10
     snap = rig.health.snapshot()
-    assert "session record failed: database is locked" in snap["storage_error"]
-    assert snap["state"] == "degraded" and "database is locked" in snap["detail"]
+    assert snap["storage_error"] is None
+    assert snap["internal_errors_total"] == 2  # the first acquisition and the one after the burst
+    assert [e["message"] for e in snap["recent_errors"] if e["kind"] == "internal error"] == [
+        "session record failed: RuntimeError: session queue broke"
+    ] * 2
+    # The traceback once; the second time, a line.
+    assert len([r for r in caplog.records if r.exc_info]) == 1
 
 
 def test_a_session_record_that_fails_on_a_reacquire_does_not_stop_sampling():

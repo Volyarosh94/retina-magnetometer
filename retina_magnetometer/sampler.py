@@ -14,13 +14,16 @@ Poll mode (the default) samples on a grid aligned to the wall clock — at
 is stamped at the middle of its conversion. Continuous mode uses the nearest
 TMRC rate and stamps each sample when it is read.
 
-The sensor's registers are checked once a minute. A brief power dip resets
-the chip to 200 cycles without a single failed transfer, and every value read
-after it would carry the wrong gain without anything else noticing. The same
-dip ends continuous mode, which the check cannot see when the configured count
-is the default 200; there, DRDY staying low for a few sample periods counts as
-a failed read (``RM3100.read_if_ready``), and three of those find the sensor
-again.
+A brief power dip resets the chip to 200 cycles without a single failed
+transfer, and in poll mode it goes on measuring, so every value read after it
+would carry the wrong gain without anything else noticing. No sample is
+therefore delivered until what the app set (the cycle counts, and TMRC), read
+back after it was measured, still reads as set, and in continuous mode until a
+later DRDY shows continuous mode was still running when it was read; a reset
+found that way drops every sample since the last good read-back and finds the
+sensor again. The same dip ends continuous mode; there, DRDY staying low for a
+few sample periods counts as a failed read (``RM3100.read_if_ready``), and
+three of those find the sensor again.
 """
 
 from __future__ import annotations
@@ -42,7 +45,19 @@ log = logging.getLogger(__name__)
 REINIT_AFTER = 3
 BACKOFF_MIN_S = 1.0
 BACKOFF_MAX_S = 30.0
-VERIFY_EVERY_S = 60.0
+# The longest a sample waits for the read-back of the registers that lets it
+# be delivered. Up to 1 Hz that is a read-back after every sample; faster, the
+# samples of up to a second share one. The read-back (the cycle counts and
+# TMRC) takes 1.2 ms of a 100 kHz bus: after every sample it would add two
+# thirds to a poll-mode measurement's own transfers and take up to 10 % off
+# poll mode's top rate, and in continuous mode at 147 Hz nearly a fifth of the
+# bus; once a second it costs neither.
+READ_BACK_EVERY_S = 1.0
+# Poll mode has no use for TMRC, the continuous-mode rate, so it sets it to a
+# value the chip never powers up with (0x96, UM16 Table 5-1): a read-back then
+# tells a chip that was reset from one still configured even at the default
+# cycle count, where the counts read the same either way.
+POLL_MODE_TMRC = reg.TMRC_MAX
 
 
 class Sampler:
@@ -77,15 +92,21 @@ class Sampler:
         self._sensor: RM3100 | None = None
         self._backoff = BACKOFF_MIN_S
         self._consecutive = 0
-        self._last_verify = 0.0
+        # Samples measured and not yet delivered, (time, measurement), waiting
+        # for the next read-back of the registers; and since when (monotonic).
+        self._held: list[tuple[float, Measurement]] = []
+        self._held_since = 0.0
+        # TMRC as it read back once the chip was configured.
+        self._tmrc_set = reg.TMRC_DEFAULT
         # Poll mode: the monotonic time of the tick the last measurement was
         # taken on, so the next one can tell whether it ran past any ticks,
         # and how long that measurement took.
         self._tick_monotonic: float | None = None
         self._measurement_s = 0.0
-        # The last unexpected error, so that its traceback is logged once
-        # rather than at every retry.
+        # The last unexpected error, and the last failure to record a session,
+        # so that each traceback is logged once rather than at every retry.
         self._unexpected: str | None = None
+        self._session_failure: str | None = None
         self._thread: threading.Thread | None = None
         self.period = 1.0 / config.sample_rate_hz
         self.tmrc = reg.tmrc_for_rate(config.sample_rate_hz)
@@ -100,18 +121,23 @@ class Sampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
-        finished = self._thread is None or not self._thread.is_alive()
-        sensor = self._sensor
-        if sensor is not None and finished and self.config.mode == "continuous":
-            # Leave the chip idle rather than measuring for nobody. The next
-            # start copes either way, but another program on the bus during
-            # bring-up should find it out of continuous mode, as poll mode
-            # leaves it (the cycle count stays as set). Not while a sampler
-            # that did not finish in time may still be using it.
-            try:
-                sensor.stop_continuous()
-            except (OSError, RM3100Error) as exc:
-                log.warning("could not stop continuous mode: %s", exc)
+        # Not while a sampler that did not finish in time may still be using
+        # the chip and the samples it holds.
+        if self._thread is None or not self._thread.is_alive():
+            # Nothing measured is lost on a clean stop: what is held is read
+            # back and delivered first, in continuous mode once the next
+            # DRDY has confirmed the newest sample.
+            confirmed = self.config.mode == "continuous" and self._sensor is not None and self._next_drdy()
+            self._settle_held(newest_confirmed=confirmed)
+            if self._sensor is not None and self.config.mode == "continuous":
+                # Leave the chip idle rather than measuring for nobody. The
+                # next start copes either way, but another program on the bus
+                # during bring-up should find it out of continuous mode, as
+                # poll mode leaves it (the cycle count and TMRC stay as set).
+                try:
+                    self._sensor.stop_continuous()
+                except (OSError, RM3100Error) as exc:
+                    log.warning("could not stop continuous mode: %s", exc)
         self._drop_sensor()
 
     def run(self) -> None:
@@ -134,6 +160,10 @@ class Sampler:
                 else:
                     log.error("sampler: %s, again; finding the sensor again in %.0f s", what, self._backoff)
                 self.health.internal_error(what)
+                if self._held:
+                    # Whatever failed may be what delivers them.
+                    log.warning("%d held samples dropped after the unexpected error", len(self._held))
+                    self._held = []
                 self._drop_sensor()
                 self._wait(self._backoff)
                 self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
@@ -145,10 +175,6 @@ class Sampler:
             self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
             return
         try:
-            if self._monotonic() - self._last_verify >= VERIFY_EVERY_S:
-                self._verify()
-                if self._sensor is None:
-                    return
             if self.config.mode == "poll":
                 self._poll_once()
             else:
@@ -208,7 +234,11 @@ class Sampler:
                 sensor.start_continuous(self.tmrc)
                 effective = reg.effective_continuous_rate_hz(self.tmrc, self.config.cycle_count)
             else:
+                sensor.set_tmrc(POLL_MODE_TMRC)
                 effective = self.config.sample_rate_hz
+            # What the read-backs compare with: TMRC as the chip holds it now,
+            # so that one which does not keep the value written is no reset.
+            tmrc_set = sensor.read_tmrc()
         except (OSError, RM3100Error) as exc:
             where = "at any of 0x20-0x23" if self.config.i2c_address is None else f"at 0x{self.config.i2c_address:02X}"
             self.health.no_sensor(bus.description, f"No RM3100 answered {where} on {bus.description}: {exc}")
@@ -217,7 +247,8 @@ class Sampler:
         self._sensor = sensor
         self._consecutive = 0
         self._tick_monotonic = None
-        self._last_verify = self._monotonic()
+        self._held = []
+        self._tmrc_set = tmrc_set
         gain = reg.gain_lsb_per_ut(self.config.cycle_count)
         self.health.sensor_ready(
             bus=bus.description,
@@ -251,11 +282,17 @@ class Sampler:
         try:
             self.on_session(**session)
         except Exception as exc:
-            # The session row records what sampling started with; whatever
-            # goes wrong recording it must not stop the sampling it describes.
-            # Health shows it as a storage problem until the next good write.
-            log.exception("could not record the session")
-            self.health.storage_update(None, f"session record failed: {exc}")
+            # The recorder queues the session and writes it with its own
+            # storage operations, whose failures it reports itself, so an
+            # exception here is a bug in the app rather than a storage
+            # problem. It must not stop the sampling the session describes.
+            what = f"{type(exc).__name__}: {exc}"
+            if what != self._session_failure:
+                self._session_failure = what
+                log.exception("could not record the session")
+            else:
+                log.error("could not record the session: %s, again", what)
+            self.health.internal_error(f"session record failed: {what}")
 
     def _drop_sensor(self) -> None:
         if self._bus is not None:
@@ -266,15 +303,81 @@ class Sampler:
         self._bus = None
         self._sensor = None
 
-    def _verify(self) -> None:
-        self._last_verify = self._monotonic()
+    # ── Reading the registers back ───────────────────────────────────────────
+
+    def _read_back(self, *, newest_confirmed: bool = False) -> None:
+        """Read back what configuring the chip set, and settle the samples
+        held until now.
+
+        If the cycle counts and TMRC still read as set, the samples are
+        delivered. In continuous mode the newest one waits for the next, or
+        for ``newest_confirmed``: a reset between the STATUS read that saw
+        DRDY and the read of the results hands over the reset registers, all
+        zeros (UM16 Table 5-1), and with every register the app sets at its
+        reset value (200 cycles, TMRC 0x96) only a DRDY after it shows that
+        continuous mode was still running. CMM would say, but reading it ends
+        continuous mode (UM16 p.31).
+
+        If anything reads otherwise, the chip was reset since the last
+        read-back, when within that span is not known: all of them are
+        dropped and the sensor found again. A failing read raises, and the
+        samples wait for the next read-back.
+        """
         counts = self._sensor.read_cycle_counts()
+        tmrc = self._sensor.read_tmrc()
+        if counts == (self.config.cycle_count,) * 3 and tmrc == self._tmrc_set:
+            waiting = 1 if self.config.mode == "continuous" and not newest_confirmed else 0
+            ready, self._held = self._held[: len(self._held) - waiting], self._held[len(self._held) - waiting :]
+            for t, m in ready:
+                self._deliver(t, m)
+            return
+        held, self._held = self._held, []
+        changed = []
         if counts != (self.config.cycle_count,) * 3:
-            self.health.error(
-                "sensor reset", f"cycle counts read {counts}, expected {self.config.cycle_count}; reconfiguring"
-            )
-            log.warning("sensor registers changed under us (%s); reconfiguring", counts)
-            self._drop_sensor()
+            changed.append(f"cycle counts read {counts}, expected {self.config.cycle_count}")
+        if tmrc != self._tmrc_set:
+            changed.append(f"TMRC read 0x{tmrc:02X}, expected 0x{self._tmrc_set:02X}")
+        dropped = f"{len(held)} sample{'' if len(held) == 1 else 's'}"
+        self.health.error(
+            "sensor reset",
+            f"{'; '.join(changed)}: the chip was reset. {dropped} measured since the last good read-back "
+            "dropped, as the reset may have come before any of them; reconfiguring",
+        )
+        log.warning("sensor registers changed under us (%s): %s dropped; reconfiguring", "; ".join(changed), dropped)
+        self._drop_sensor()
+
+    def _settle_held(self, *, newest_confirmed: bool = False) -> None:
+        """Before letting go of the sensor: a last read-back for the samples
+        it still holds, or, if the chip does not answer, dropping them. What
+        the read-back leaves unconfirmed is dropped too: nothing will confirm
+        it now."""
+        if not self._held:
+            return
+        if self._sensor is None:
+            log.warning("%d held samples dropped: no sensor to read the registers back from", len(self._held))
+        else:
+            try:
+                self._read_back(newest_confirmed=newest_confirmed)
+            except (OSError, RM3100Error) as exc:
+                log.warning("%d held samples dropped: the registers could not be read back (%s)", len(self._held), exc)
+            else:
+                if self._held:
+                    log.info("the newest sample dropped: no DRDY after it showed continuous mode still running")
+        self._held = []
+
+    def _next_drdy(self) -> bool:
+        """Continuous mode, at a clean stop: whether DRDY rises within one
+        sample period (at most a second), confirming the newest sample."""
+        rate = reg.effective_continuous_rate_hz(self.tmrc, self.config.cycle_count)
+        deadline = self._monotonic() + min(1.0 / rate + RM3100.DRDY_MARGIN_S, 1.0)
+        try:
+            while not self._sensor.data_ready():
+                if self._monotonic() >= deadline:
+                    return False
+                self._sensor_sleep(RM3100.DRDY_POLL_S)
+        except (OSError, RM3100Error):
+            return False
+        return True
 
     # ── Sampling ─────────────────────────────────────────────────────────────
 
@@ -299,24 +402,36 @@ class Sampler:
         measurement = self._sensor.single_measurement()
         self._measurement_s = self._monotonic() - began
         conversion = reg.xyz_conversion_s(measurement.cycle_count)
-        self._deliver(started + conversion / 2.0, measurement)
+        self._measured(started + conversion / 2.0, measurement)
 
     def _continuous_once(self) -> None:
         measurement = self._sensor.read_if_ready()
         if measurement is None:
             self._wait(min(self.period / 4.0, 0.05))
             return
-        self._deliver(self._clock(), measurement)
+        self._measured(self._clock(), measurement)
+
+    def _measured(self, t: float, m: Measurement) -> None:
+        """Hold a new sample until a read-back confirms its gain, reading back
+        now if waiting for the next sample would hold the oldest one longer
+        than READ_BACK_EVERY_S (so after every sample at up to 1 Hz)."""
+        self._consecutive = 0
+        if not self._held:
+            self._held_since = self._monotonic()
+        self._held.append((t, m))
+        if self._monotonic() - self._held_since + self.period < READ_BACK_EVERY_S:
+            return
+        self._read_back()
+        if self._sensor is not None:
+            # Samples got all the way through: the end of any run of
+            # failures, and with it the backoff.
+            self._backoff = BACKOFF_MIN_S
+            self._unexpected = None
 
     def _deliver(self, t: float, m: Measurement) -> None:
         x, y, z = m.x_nt, m.y_nt, m.z_nt
-        self._consecutive = 0
         self.health.sample(t, x, y, z)
         self.on_sample(int(round(t * 1000)), x, y, z)
-        # Only a sample that got all the way through ends a run of failures,
-        # and with it the backoff.
-        self._backoff = BACKOFF_MIN_S
-        self._unexpected = None
 
     def _failed(self, exc: Exception) -> None:
         if isinstance(exc, DataReadyTimeout):
@@ -331,6 +446,7 @@ class Sampler:
         log.warning("sample failed (%d in a row): %s", self._consecutive, exc)
         if self._consecutive >= REINIT_AFTER:
             log.warning("dropping the sensor after %d failures; will look for it again", self._consecutive)
+            self._settle_held()
             self._drop_sensor()
             self._wait(self._backoff)
             self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)

@@ -251,7 +251,7 @@ class RM3100:
         if not reg.TMRC_MIN <= tmrc <= reg.TMRC_MAX:
             raise ValueError(f"TMRC must be 0x{reg.TMRC_MIN:02X}..0x{reg.TMRC_MAX:02X}")
         self.stop_continuous()
-        self._write(reg.TMRC, bytes([tmrc]))
+        self.set_tmrc(tmrc)
         self._write(reg.CMM, bytes([reg.CMM_CONTINUOUS_XYZ]))
         period = 1.0 / reg.effective_continuous_rate_hz(tmrc, self.cycle_count)
         self._continuous_timeout_s = self.CONTINUOUS_TIMEOUT_PERIODS * period + self.DRDY_MARGIN_S
@@ -260,6 +260,17 @@ class RM3100:
     def stop_continuous(self) -> None:
         self._write(reg.CMM, b"\x00")
         self._continuous_deadline = None
+
+    def set_tmrc(self, tmrc: int) -> None:
+        """Write TMRC, the continuous-mode rate. Only with continuous mode
+        stopped: writing TMRC while it runs ends it (UM16 p.31)."""
+        if not reg.TMRC_MIN <= tmrc <= reg.TMRC_MAX:
+            raise ValueError(f"TMRC must be 0x{reg.TMRC_MIN:02X}..0x{reg.TMRC_MAX:02X}")
+        self._write(reg.TMRC, bytes([tmrc]))
+
+    def read_tmrc(self) -> int:
+        """Read TMRC. Unlike reading CMM, this leaves continuous mode running."""
+        return self._read_byte(reg.TMRC)
 
     def read_if_ready(self) -> Measurement | None:
         """Continuous mode: the new sample if DRDY is up, otherwise None.

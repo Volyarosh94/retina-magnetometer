@@ -265,6 +265,20 @@ class TestContinuousMode:
         with pytest.raises(ValueError):
             sensor(ScriptedBus()).start_continuous(0x91)
 
+    def test_tmrc_is_written_and_read_on_its_own(self):
+        bus = ScriptedBus().expect(A, b"\x0b\x9f").expect(A, b"\x0b", 1, b"\x9f")
+        s = sensor(bus)
+        s.set_tmrc(0x9F)
+        assert s.read_tmrc() == 0x9F
+        bus.assert_done()
+
+    @pytest.mark.parametrize("bad", [0x00, 0x91, 0xA0])
+    def test_an_invalid_tmrc_never_reaches_the_bus(self, bad):
+        bus = ScriptedBus()
+        with pytest.raises(ValueError):
+            sensor(bus).set_tmrc(bad)
+        assert bus.log == []
+
     def test_read_if_ready_only_reads_results_after_drdy(self):
         bus = ScriptedBus().expect_status(A, 0x00).expect_status(A, 0x80).expect(A, b"\x24", 9, result_bytes(5, 6, 7))
         s = sensor(bus)
