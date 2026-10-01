@@ -11,18 +11,33 @@
 
 A gap (a stretch with no samples) is a point whose values are all null, which
 the chart draws as a break instead of a straight line across the outage.
+
+Buckets sit on a grid of their own width, counted from the epoch rather than
+from the start of the request. A window that slides forward therefore keeps
+the same buckets: the chart does not shimmer as each refresh regroups the
+samples, and a client holding the last response needs only the points from its
+newest one on (``tail``). Values are rounded to 0.01 nT, far below one count
+of the sensor (2.7 nT at its highest cycle count) and below its noise, which
+halves the JSON.
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 
 AXES = ("x", "y", "z", "b")
 MAX_POINTS_CAP = 20_000
+DECIMALS = 2
 
 
 def clamp_points(max_points: int) -> int:
     return max(10, min(int(max_points), MAX_POINTS_CAP))
+
+
+def bucket_width(start_ms: int, end_ms: int, max_points: int) -> int:
+    """The bucket width that fits [start, end) into about ``max_points`` points."""
+    return max(1, math.ceil(max(1, end_ms - start_ms) / max_points))
 
 
 def empty(source: str, bucket_ms: int) -> dict:
@@ -58,13 +73,13 @@ def append_point(out: dict, t: int, n: int, values: tuple) -> None:
     out["t"].append(t)
     out["n"].append(n)
     for i, axis in enumerate(AXES):
-        out[axis]["min"].append(values[3 * i])
-        out[axis]["mean"].append(values[3 * i + 1])
-        out[axis]["max"].append(values[3 * i + 2])
+        out[axis]["min"].append(round(values[3 * i], DECIMALS))
+        out[axis]["mean"].append(round(values[3 * i + 1], DECIMALS))
+        out[axis]["max"].append(round(values[3 * i + 2], DECIMALS))
 
 
 def raw_points(rows, source: str) -> dict:
-    """Unaggregated (t, x, y, z) rows, with gaps marked."""
+    """Unaggregated (t, x, y, z) rows, in time order, with gaps marked."""
     out = empty(source, 0)
     gap = gap_threshold_ms([r[0] for r in rows])
     previous = None
@@ -77,29 +92,31 @@ def raw_points(rows, source: str) -> dict:
     return out
 
 
-def bucketed_points(rows, start_ms: int, bucket_ms: int, source: str) -> dict:
-    """Rows of (k, t_first, n, 12 statistics) ordered by bucket index k."""
+def bucketed_points(rows, bucket_ms: int, source: str) -> dict:
+    """Rows of (k, t_first, n, 12 statistics) ordered by bucket index k, where
+    bucket k starts at k * bucket_ms."""
     out = empty(source, bucket_ms)
     previous_k = None
     for row in rows:
         k = row[0]
         if previous_k is not None and k - previous_k > 2:
-            append_gap(out, start_ms + (previous_k + 1) * bucket_ms)
-        append_point(out, start_ms + k * bucket_ms, row[2], tuple(row[3:]))
+            append_gap(out, (previous_k + 1) * bucket_ms)
+        append_point(out, k * bucket_ms, row[2], tuple(row[3:]))
         previous_k = k
     return out
 
 
 def bucket_rows(rows, start_ms: int, end_ms: int, max_points: int, source: str = "memory") -> dict:
-    """``Storage.series`` for rows already in memory: same shape, same rules."""
+    """``Storage.series`` for rows already in memory (in time order): same
+    shape, same rules."""
     rows = [r for r in rows if start_ms <= r[0] < end_ms]
     max_points = clamp_points(max_points)
     if len(rows) <= max_points:
         return raw_points(rows, source)
-    bucket = max(1, math.ceil((end_ms - start_ms) / max_points))
+    bucket = bucket_width(start_ms, end_ms, max_points)
     groups: dict[int, list] = {}
     for t, x, y, z in rows:
-        groups.setdefault((t - start_ms) // bucket, []).append((x, y, z, magnitude(x, y, z)))
+        groups.setdefault(t // bucket, []).append((x, y, z, magnitude(x, y, z)))
     summarised = []
     for k in sorted(groups):
         members = groups[k]
@@ -108,4 +125,18 @@ def bucket_rows(rows, start_ms: int, end_ms: int, max_points: int, source: str =
             values = [m[i] for m in members]
             stats.extend((min(values), sum(values) / len(values), max(values)))
         summarised.append((k, None, len(members), *stats))
-    return bucketed_points(summarised, start_ms, bucket, source)
+    return bucketed_points(summarised, bucket, source)
+
+
+def tail(data: dict, since_ms: int) -> dict:
+    """The points of ``data`` from ``since_ms`` on, everything else as it is.
+
+    What a client holding an earlier response for the same span and points
+    lacks, if ``since_ms`` is the time of its newest point: on a fixed grid,
+    the buckets before it have not changed (that last one may have filled up,
+    and comes again)."""
+    first = bisect.bisect_left(data["t"], since_ms)
+    out = {**data, "t": data["t"][first:], "n": data["n"][first:]}
+    for axis in AXES:
+        out[axis] = {key: values[first:] for key, values in data[axis].items()}
+    return out

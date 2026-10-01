@@ -26,7 +26,9 @@ full attitude. What it reports, and why each part is sound:
    the magnitude mismatch and the model's declination error.
 
 Near the magnetic equator (shallow dip) step 3 becomes ambiguous and the
-result says so.
+result says so. Where the field has almost no horizontal part (near a
+magnetic pole, or with two dead axes) step 4 has nothing to point along: the
+result gives no heading, and says why.
 """
 
 from __future__ import annotations
@@ -53,6 +55,11 @@ _AXES: tuple[tuple[str, Vec], ...] = (
 # for a sensor on a bracket; beyond 10° the heading assumption is shaky.
 MAGNITUDE_TOLERANCE = 0.05
 TILT_WARN_DEG = 10.0
+# Below this much horizontal field there is no heading worth giving: NOAA's
+# blackout zone around the magnetic poles, where compasses are unreliable, is
+# where H < 2,000 nT. A level sensor measures that little only there, or with
+# two dead axes, or tilted until its downward axis lies along the field.
+MIN_HORIZONTAL_NT = 2000.0
 
 
 def _dot(a: Vec, b: Vec) -> float:
@@ -278,6 +285,36 @@ def estimate(measured: Vec, samples: int, reference: Reference | None) -> Orient
         measured[2] - along_down * down[2],
     )
     h_len = _norm(horizontal)
+    if h_len < MIN_HORIZONTAL_NT:
+        if reference.horizontal < MIN_HORIZONTAL_NT:
+            why = (
+                f"This close to a magnetic pole the field is almost vertical (WMM2025's horizontal part here is "
+                f"{reference.horizontal:,.0f} nT), and no compass heading is meaningful."
+            )
+        else:
+            why = (
+                f"The model expects {reference.horizontal:,.0f} nT. Two axes reading zero would do this, or a "
+                "sensor tilted until its downward axis lies along the field."
+            )
+        notes.append(f"The field has almost no horizontal part here ({h_len:,.0f} nT), so it gives no heading. {why}")
+        return Orientation(
+            measured=measured,
+            measured_total=total,
+            samples=samples,
+            reference=reference,
+            magnitude_ratio=ratio,
+            down_axis=best.axis,
+            tilt_min_deg=best.tilt_min_deg,
+            ambiguous=ambiguous,
+            heading_axis=None,
+            heading_magnetic_deg=None,
+            heading_true_deg=None,
+            heading_sigma_deg=None,
+            up_axis=_opposite(best.axis),
+            verdict="check",
+            notes=tuple(notes),
+            candidates=tuple(candidates),
+        )
     north = (horizontal[0] / h_len, horizontal[1] / h_len, horizontal[2] / h_len)
     # Clockwise from magnetic north, looking down: atan2((n x r) . d, n . r).
     heading_mag = (

@@ -121,3 +121,30 @@ class TestWithoutEnough:
 
         json.dumps(o.estimate(mounted(37.0, roll=180.0), 60, REF).as_dict())
         json.dumps(o.estimate((1.0, 2.0, 3.0), 60, None).as_dict())
+
+
+class TestNoHorizontalField:
+    def test_a_field_along_one_axis_gives_no_heading(self):
+        # Two axes reading zero (dead coils): the field lies along the third,
+        # with no horizontal part to take a heading from. It used to raise
+        # ZeroDivisionError, which the page showed as HTTP 500.
+        est = o.estimate((0.0, 0.0, 48_000.0), 60, REF)
+        assert est.down_axis == "+Z" and est.up_axis == "-Z"
+        assert est.heading_true_deg is None and est.heading_magnetic_deg is None and est.heading_sigma_deg is None
+        assert est.heading_axis is None and est.verdict == "check"
+        assert any("no heading" in note and "Two axes reading zero" in note for note in est.notes)
+        import json
+
+        json.dumps(est.as_dict())
+
+    def test_a_small_horizontal_part_gives_none_either(self):
+        est = o.estimate((900.0, -900.0, 48_000.0), 60, REF)
+        assert est.heading_true_deg is None and est.verdict == "check"
+        assert o.estimate((2100.0, 0.0, 48_000.0), 60, REF).heading_true_deg is not None
+
+    def test_near_a_magnetic_pole_the_note_says_so(self):
+        pole = o.reference_field(Location(86.0, 140.0, 0.0, "test"), WHEN)
+        assert pole.horizontal < o.MIN_HORIZONTAL_NT
+        est = o.estimate((pole.x, pole.y, pole.z), 60, pole)
+        assert est.heading_true_deg is None
+        assert any("magnetic pole" in note for note in est.notes)

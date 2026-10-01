@@ -3,14 +3,21 @@
 Every sample lands in two places. An in-memory ring buffer holds the last
 hour (bounded in count), which the live chart and the orientation estimate
 read without touching the card. A pending list is flushed to SQLite in one
-transaction every ``flush_interval_s``. The same background thread also rolls
+transaction every ``flush_interval_s``, together with any session records, so
+the sampler never waits on the disk. The same background thread also rolls
 up complete minutes, applies retention, refreshes storage statistics and
 rewrites the status file.
+
+The schedule runs on the monotonic clock. Samples carry wall-clock time, and
+a wall clock that steps back (an NTP correction, an RTC-less board setting
+its time) would otherwise hold every flush, roll-up and status write until it
+caught up again.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -18,7 +25,7 @@ from collections import deque
 
 from retina_magnetometer.config import Config
 from retina_magnetometer.health import Health, write_status_file
-from retina_magnetometer.storage import Storage
+from retina_magnetometer.storage import Storage, StorageUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -32,29 +39,78 @@ STATUS_EVERY_S = 5.0
 # simulator's backfill, run beside the app). A count scans the table, a few
 # tens of milliseconds at a week of 1 Hz, so once a minute, not every status.
 STATS_EVERY_S = 60.0
+# The status file's name among the storage operations that can fail.
+STATUS = "status.json"
 
 
 class Recorder:
-    def __init__(self, storage: Storage, health: Health, config: Config, *, clock=time.time):
+    def __init__(self, storage: Storage, health: Health, config: Config, *, clock=time.time, monotonic=time.monotonic):
         self.storage = storage
         self.health = health
         self.config = config
-        self._clock = clock
+        self._clock = clock  # wall time, for the session records
+        self._monotonic = monotonic  # the schedule
         self._lock = threading.Lock()
         size = min(int(config.sample_rate_hz * RECENT_SECONDS) + 16, RECENT_MAX_SAMPLES)
         self._recent: deque = deque(maxlen=size)
         self._pending: list[tuple[int, float, float, float]] = []
+        self._pending_from: int | None = None  # the oldest pending sample's time
+        self._sessions: list[dict] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last = {"flush": 0.0, "rollup": 0.0, "prune": 0.0, "stats": 0.0, "status": 0.0}
+        # Never run, so the first tick runs everything.
+        self._last = dict.fromkeys(("flush", "rollup", "prune", "stats", "status"), -math.inf)
+        # Each storage operation failing now, and how. The storage problem on
+        # the page is all of them together, and it clears only when the last
+        # one works again: a roll-up that keeps failing is not cleared by every
+        # flush that gets through, and a problem that is over does not wait
+        # for a flush with rows in it (a node with no sensor has none). Each
+        # is logged when it starts or changes, not every few seconds.
+        self._failing: dict[str, str] = {}
+        # Logged once each, but not storage problems of their own: samples
+        # being dropped (the failing write says why), and housekeeping bugs.
+        self._noted: dict[str, str] = {}
 
     # ── Intake (sampler thread) ──────────────────────────────────────────────
 
     def add(self, t_ms: int, x: float, y: float, z: float) -> None:
         row = (t_ms, x, y, z)
         with self._lock:
+            newest = self._recent[-1][0] if self._recent else None
+            # A time at or before the newest one means the wall clock stepped
+            # back (or two reads fell in one millisecond). The buffer drops its
+            # tail from that time on, so it stays in time order; those samples
+            # are still pending, and nothing unwritten is lost.
+            while self._recent and self._recent[-1][0] >= t_ms:
+                self._recent.pop()
             self._recent.append(row)
             self._pending.append(row)
+            if self._pending_from is None or t_ms < self._pending_from:
+                self._pending_from = t_ms
+        if newest is not None and t_ms < newest:
+            log.warning(
+                "the clock went back %.3f s; the live buffer dropped its samples from after the new time",
+                (newest - t_ms) / 1000,
+            )
+
+    def start_session(
+        self, *, cycle_count: int, gain: float, rate_hz: float, mode: str, bus: str, address: int
+    ) -> None:
+        """Record that sampling (re)started, with what is in force. Written
+        with the next flush, stamped now. The arguments are spelt out so that
+        a caller passing the wrong ones fails at once, in its own thread,
+        rather than poisoning a flush here."""
+        session = {
+            "started_ms": int(self._clock() * 1000),
+            "cycle_count": cycle_count,
+            "gain": gain,
+            "rate_hz": rate_hz,
+            "mode": mode,
+            "bus": bus,
+            "address": address,
+        }
+        with self._lock:
+            self._sessions.append(session)
 
     def recent(self, since_ms: int | None = None) -> list[tuple[int, float, float, float]]:
         with self._lock:
@@ -67,6 +123,12 @@ class Recorder:
         """How far back the ring buffer reaches, or None when empty."""
         with self._lock:
             return self._recent[0][0] if self._recent else None
+
+    def pending_from_ms(self) -> int | None:
+        """The oldest sample not yet on disk, or None: minutes from it on are
+        not complete in the database yet."""
+        with self._lock:
+            return self._pending_from
 
     # ── Housekeeping (its own thread) ────────────────────────────────────────
 
@@ -83,22 +145,34 @@ class Recorder:
 
     def _run(self) -> None:
         while not self._stop.wait(0.5):
-            self.tick()
+            try:
+                self.tick()
+            except Exception as exc:
+                # Each task already fails on its own; this is the last line.
+                # Nothing may end this thread: without it nothing is written
+                # and status.json goes stale while the page looks alive.
+                problem = f"{type(exc).__name__}: {exc}"
+                if self._noted.get("unexpected") != problem:
+                    self._noted["unexpected"] = problem
+                    log.exception("housekeeping failed: %s", problem)
+                    self.health.internal_error(f"housekeeping: {problem}")
 
     def tick(self) -> None:
-        now = self._clock()
+        now = self._monotonic()
         if now - self._last["flush"] >= self.config.flush_interval_s:
             self._last["flush"] = now
             self.flush()
         if now - self._last["rollup"] >= ROLLUP_EVERY_S:
             self._last["rollup"] = now
-            self._guarded("rollup", self.storage.rollup)
+            # Only as far as what is on disk: with a long flush interval the
+            # samples of a minute that ended a while ago may still be pending.
+            self._guarded("rollup", self.storage.rollup, pending_from_ms=self.pending_from_ms())
         if now - self._last["prune"] >= PRUNE_EVERY_S:
             self._last["prune"] = now
             removed = self._guarded("prune", self.storage.prune)
             if removed and removed.get("size_capped"):
                 log.warning("database reached its size cap; oldest data removed: %s", removed)
-            self._last["stats"] = 0.0  # what the prune removed shows at once
+            self._last["stats"] = -math.inf  # what the prune removed shows at once
         if now - self._last["stats"] >= STATS_EVERY_S:
             self._last["stats"] = now
             self._refresh_stats()
@@ -109,36 +183,82 @@ class Recorder:
     def flush(self) -> None:
         with self._lock:
             rows, self._pending = self._pending, []
-        if not rows:
+            sessions, self._sessions = self._sessions, []
+            self._pending_from = None
+        if not rows and not sessions:
             return
         try:
-            self.storage.write_samples(rows)
-        except (sqlite3.Error, OSError) as exc:
-            # Keep them for the next attempt rather than drop them; the buffer
-            # is bounded so a dead disk cannot grow memory without limit.
+            self.storage.write_samples(rows, sessions=sessions)
+        except Exception as exc:
+            # Keep them for the next attempt rather than drop them, whatever
+            # went wrong; the buffer is bounded so a dead disk cannot grow
+            # memory without limit.
             with self._lock:
-                self._pending = (rows + self._pending)[-RECENT_MAX_SAMPLES:]
-            self.health.storage_update(None, f"write failed: {exc}")
-            log.error("could not write %d samples: %s", len(rows), exc)
+                kept = rows + self._pending
+                dropped = max(0, len(kept) - RECENT_MAX_SAMPLES)
+                self._pending = kept[dropped:]
+                self._sessions = sessions + self._sessions
+                self._pending_from = min((r[0] for r in self._pending), default=None)
+            self._failed("write", exc)
+            if dropped and "dropped" not in self._noted:
+                self._noted["dropped"] = "dropping"
+                log.error(
+                    "%d samples wait to be written, the most kept: the oldest are being dropped", RECENT_MAX_SAMPLES
+                )
         else:
-            if self.health.storage_error:
-                self.health.storage_update(None, None)
+            self._noted.pop("dropped", None)
+            self._succeeded("write")
 
-    def _guarded(self, what: str, fn):
+    def _guarded(self, what: str, fn, *args, **kwargs):
+        # Each task fails on its own: one that keeps failing must not hold up
+        # the ones after it in a tick, the status file above all.
         try:
-            return fn()
-        except (sqlite3.Error, OSError) as exc:
-            self.health.storage_update(None, f"{what} failed: {exc}")
-            log.error("%s failed: %s", what, exc)
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            self._failed(what, exc)
             return None
+        self._succeeded(what)
+        return result
+
+    def _failed(self, what: str, exc: Exception) -> None:
+        # A database that cannot be opened is one problem, whichever call
+        # met it, and its message already says what it is. Anything but a
+        # storage error is a bug, logged with where it happened.
+        expected = isinstance(exc, (sqlite3.Error, OSError))
+        detail = str(exc) if expected else f"{type(exc).__name__}: {exc}"
+        key, problem = ("open", detail) if isinstance(exc, StorageUnavailable) else (what, f"{what} failed: {detail}")
+        if self._failing.get(key) != problem:
+            log.error("%s", problem, exc_info=not expected)
+        self._failing[key] = problem
+        self._report()
+
+    def _succeeded(self, what: str) -> None:
+        # Any operation on the database shows it opens; writing status.json
+        # does not.
+        keys = (what,) if what == STATUS else (what, "open")
+        cleared = [key for key in keys if self._failing.pop(key, None) is not None]
+        for key in cleared:
+            log.info("storage: %s works again", "the database" if key == "open" else key)
+        if cleared:
+            self._report()
+
+    def _report(self, stats: dict | None = None) -> None:
+        self.health.storage_update(stats, "; ".join(self._failing.values()) or None)
 
     def _refresh_stats(self) -> None:
         stats = self._guarded("stats", self.storage.stats)
         if stats is not None:
-            self.health.storage_update(stats, self.health.storage_error)
+            self._report(stats)
 
     def _write_status(self) -> None:
+        recovering = STATUS in self._failing
         try:
             write_status_file(self.config.status_path, self.health.snapshot())
-        except OSError as exc:
-            log.error("could not write %s: %s", self.config.status_path, exc)
+        except Exception as exc:
+            self._failed(STATUS, exc)
+            return
+        self._succeeded(STATUS)
+        if recovering:
+            # That one was written while its own failure still stood; this one
+            # says it is over.
+            self._write_status()
