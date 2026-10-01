@@ -36,12 +36,21 @@ history meets a minute summary it stops at that minute's start, which can
 leave up to a minute without samples at the seam. Its session is stamped
 where its history starts, so the app's own session stays the newest.
 
+`backfill` only writes. Retention and the size cap are the app's
+housekeeping: on its next pass the app applies the node's own settings to the
+backfilled history, so samples past its raw retention go and their minute
+summaries stay, and a 30-day backfill still fills the 30-day view. A refused
+run leaves no trace: the scenario and the span are checked before the
+database is looked at, the database is read without being changed (no schema
+set up, nothing set aside, not even SQLite's companion files), and it is
+opened for writing only once everything has passed. An unreadable database is
+reported and left as it is; setting it aside is the app's call when it starts.
+
 Arguments are checked before anything is written: the cycle count
 must be one the app accepts (30 to 1000), the rate no faster than the chip
 can measure all three axes at that cycle count (146.6 Hz at 200), days at
-most the five years WMM2025 covers, the retention and size settings within
-the app's own limits, and durations and speeds positive (speeds up to
-100,000). A bad one is a usage error and an unreadable scenario file a
+most the five years WMM2025 covers, and durations and speeds positive (speeds
+up to 100,000). A bad one is a usage error and an unreadable scenario file a
 scenario error, never a traceback or an empty file.
 
 ## The chip (`device.py`)

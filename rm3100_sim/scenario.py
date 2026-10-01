@@ -147,11 +147,6 @@ def _anchored(value: Any, start: float, where: str) -> tuple[float, str]:
     return start + offset, f"+{offset!r}"
 
 
-def parse_time(value: Any, start: float, where: str) -> float:
-    """An absolute epoch time from ``+offset`` (relative to ``start``) or ISO 8601."""
-    return _anchored(value, start, where)[0]
-
-
 def parse_instant(value: Any, where: str) -> float:
     if isinstance(value, datetime):
         moment = value if value.tzinfo else value.replace(tzinfo=timezone.utc)

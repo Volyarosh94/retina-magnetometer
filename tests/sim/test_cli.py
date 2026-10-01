@@ -3,13 +3,16 @@
 import csv
 import json
 import queue
+import random
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -178,8 +181,6 @@ class TestArguments:
             ["backfill", "--days", "-1"],
             ["backfill", "--days", "1e308"],
             ["backfill", "--cycle-count", "0"],
-            ["backfill", "--raw-retention-days", "1e308"],
-            ["backfill", "--max-db-mb", "1e308"],
             ["generate", "--rate", "1e308"],
             ["generate", "--rate", "147"],  # 200 cycles allow 146.6 complete samples a second
             ["generate", "--cycle-count", "800", "--rate", "38"],
@@ -306,6 +307,87 @@ class TestBackfill:
         assert main(["backfill", "--scenario", "quiet-day", "--days", "1500", "--data-dir", str(data)]) == 2
         assert "WMM2025" in capsys.readouterr().err
         assert not data.exists()
+
+    @pytest.mark.parametrize(
+        "database", ["the app's, closed", "the app's, open in the app", "unreadable", "without the app's other tables"]
+    )
+    @pytest.mark.parametrize("mistake", ["a scenario typo", "history before 2025"])
+    def test_a_refused_backfill_leaves_the_database_as_it_was(self, tmp_path, database, mistake):
+        # Byte for byte, and no file added or removed: no schema set up,
+        # nothing set aside, no new database, no companion files. The one
+        # exception is the WAL index (-shm) of a database the app has open,
+        # which every reader of it updates.
+        data = tmp_path / "data"
+        data.mkdir()
+        path = data / "magnetometer.sqlite"
+        oldest = int(datetime(2025, 1, 2, tzinfo=timezone.utc).timestamp() * 1000)
+        app = None
+        if database.startswith("the app's"):
+            written = tmp_path / "written" / "magnetometer.sqlite"
+            storage = Storage(written, raw_retention_days=7, rollup_retention_days=365, max_db_mb=64)
+            storage.write_samples([(oldest + 1000 * k, 1.0, 2.0, 3.0) for k in range(120)])
+            storage.summarise_range(oldest, oldest + 120_000)
+            with sqlite3.connect(written) as db:  # everything into the main file, as a clean close leaves it
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.close()
+            shutil.copyfile(written, path)
+            if database.endswith("open in the app"):
+                app = sqlite3.connect(path)
+                app.execute("SELECT COUNT(*) FROM samples").fetchone()
+        elif database == "unreadable":
+            path.write_bytes(random.Random(1).randbytes(8192))
+        else:
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE samples (t_ms INTEGER PRIMARY KEY, x REAL, y REAL, z REAL)")
+                db.execute("INSERT INTO samples VALUES (?, 1, 2, 3)", (oldest,))
+            db.close()
+
+        def contents():
+            return {p.name: None if p.name.endswith("-shm") else p.read_bytes() for p in data.iterdir()}
+
+        before = contents()
+        args = ["backfill", "--data-dir", str(data)]
+        if mistake == "a scenario typo":
+            args += ["--scenario", "quiet-dya"]
+        else:
+            args += ["--scenario", "quiet-day", "--days", "2"]  # ends on 2 January 2025, so would start in 2024
+        try:
+            assert main(args) in (1, 2)
+            assert contents() == before
+        finally:
+            if app is not None:
+                app.close()
+
+    def test_an_unreadable_database_is_reported_and_left_alone(self, tmp_path, capsys):
+        # Setting it aside is the app's call, made when it starts, not backfill's.
+        path = tmp_path / "magnetometer.sqlite"
+        path.write_bytes(random.Random(2).randbytes(8192))
+        assert main(["backfill", "--scenario", "quiet-day", "--days", "0.01", "--data-dir", str(tmp_path)]) == 1
+        assert "cannot read the database" in capsys.readouterr().err
+        assert [p.name for p in tmp_path.iterdir()] == ["magnetometer.sqlite"]
+
+    def test_backfill_reads_a_database_the_app_has_open(self, tmp_path):
+        path = tmp_path / "magnetometer.sqlite"
+        storage = Storage(path, raw_retention_days=7, rollup_retention_days=365, max_db_mb=64)
+        first = (int(time.time()) - 120) * 1000 + 3
+        storage.write_samples([(first + 1000 * k, 1.0, 2.0, 3.0) for k in range(100)])
+        app = sqlite3.connect(path)  # the app's connection, as while it runs
+        try:
+            app.execute("SELECT COUNT(*) FROM samples").fetchone()
+            assert main(["backfill", "--scenario", "quiet-day", "--days", "0.001", "--data-dir", str(tmp_path)]) == 0
+        finally:
+            app.close()
+        rows = storage.raw_rows(0, first + 10**9, 10**6)
+        assert len(rows) == 100 + 86 and max(row[0] for row in rows[:86]) < first
+
+    @pytest.mark.usefixtures("commands_never_run")
+    @pytest.mark.parametrize("option", ["--raw-retention-days", "--max-db-mb"])
+    def test_housekeeping_is_left_to_the_app(self, option, capsys):
+        # backfill only writes: the app applies the node's own retention and
+        # size cap to what it wrote, on its next pass.
+        with pytest.raises(SystemExit) as info:
+            main(["backfill", option, "100"])
+        assert info.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
 
 
 def test_bad_scenario_is_a_clean_error(tmp_path, capsys):

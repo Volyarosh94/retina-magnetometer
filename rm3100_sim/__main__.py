@@ -88,19 +88,6 @@ def _at_most(high: float, what: str):
     return parse
 
 
-def _between(low: float, high: float):
-    """A number from ``low`` to ``high``, for argparse: the limits the node
-    app itself puts on the same setting."""
-
-    def parse(text: str) -> float:
-        value = _positive(text)
-        if not low <= value <= high:
-            raise argparse.ArgumentTypeError(f"expected a number from {low:g} to {high:,g}, got {text!r}")
-        return value
-
-    return parse
-
-
 def _cycle_count(text: str) -> int:
     # The range the node app accepts, so simulated data is data the app could
     # have recorded.
@@ -147,7 +134,7 @@ def cmd_serve(args) -> int:
         print(f"cannot listen on {args.host}:{args.port}: {exc.strerror or exc}", file=sys.stderr)
         return 1
 
-    def stop(signum, _frame):
+    def stop(_signum, _frame):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
@@ -253,6 +240,33 @@ def cmd_generate(args) -> int:
 # ── backfill ─────────────────────────────────────────────────────────────────
 
 
+def _history_start_ms(path: Path) -> int | None:
+    """When the history in the app's database begins, in ms: its oldest sample
+    or oldest minute summary, whichever is older. None if it holds neither.
+
+    Read past the app's storage layer, which on opening sets up its schema and
+    sets an unreadable file aside. A database with its WAL companion files
+    present is open in the app (or was left by a crash) and is read through
+    them; one without them was closed cleanly, so the main file holds
+    everything, and it is read as immutable, which adds no companions of its
+    own. Either way nothing is written.
+    """
+    companions = any(Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm"))
+    db = sqlite3.connect(f"{path.resolve().as_uri()}?{'mode=ro' if companions else 'immutable=1'}", uri=True)
+    try:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        # One lone MIN per table, which SQLite answers from the key's index.
+        oldest = [
+            db.execute(f"SELECT MIN(t_ms) FROM {table}").fetchone()[0]  # noqa: S608 - fixed table names
+            for table in ("samples", "minutes")
+            if table in tables
+        ]
+    finally:
+        db.close()
+    held = [ms for ms in oldest if ms is not None]
+    return min(held) if held else None
+
+
 def cmd_backfill(args) -> int:
     """Write simulated history into the app's database, so a fresh install
     shows what a week of data looks like.
@@ -265,41 +279,45 @@ def cmd_backfill(args) -> int:
     outlive their samples (seven days of raw samples, a year of minutes). The
     node app need not be stopped: SQLite serialises the writes.
 
-    Everything is checked before anything is written, and a database that is
-    not there yet is only created then, so a mistake leaves nothing behind.
+    It only writes. Retention and the size cap are the app's housekeeping:
+    on its next pass the app applies the node's own settings to what was
+    written here, so samples past its raw retention go and their minute
+    summaries stay.
+
+    A refused run leaves no trace. The scenario and the span are checked
+    before the database is looked at; the database is read without being
+    changed (no schema set up, nothing set aside, no companion files); and it
+    is opened for writing only once everything has passed.
     """
     from retina_magnetometer.storage import Storage
 
     path = Path(args.data_dir) / "magnetometer.sqlite"
     span_s = args.days * 86_400
-
-    def open_storage() -> Storage:
-        return Storage(
-            path,
-            raw_retention_days=max(args.days, args.raw_retention_days),
-            rollup_retention_days=max(args.days, 365),
-            max_db_mb=args.max_db_mb,
-        )
-
-    end_ms = round(time.time() * 1000)
-    if path.exists():
-        try:
-            stats = open_storage().stats()
-        except (OSError, sqlite3.Error) as exc:
-            print(f"cannot read the database in {args.data_dir}: {exc}", file=sys.stderr)
-            return 1
-        held = [ms for ms in (stats["oldest_sample_ms"], stats["oldest_minute_ms"]) if ms is not None]
-        if held:
-            end_ms = min(held)
-    end = end_ms / 1000.0
-    start = end - span_s
-    sc.check_span(start, end)
-    scenario = sc.load(args.scenario, start=start, seed=args.seed)
     total = _sample_count(span_s, args.rate)
     if total == 0:
         print(f"nothing to write: {args.days:g} days at {args.rate:g} Hz is less than one sample", file=sys.stderr)
         return 2
-    storage = open_storage()
+    # Checked as if the history ended now. Ending earlier, where the stored
+    # history begins, only moves the start back, so whatever fails here would
+    # fail there too.
+    now = time.time()
+    sc.check_span(now - span_s, now)
+    sc.load(args.scenario, start=now - span_s, seed=args.seed)
+    end_ms = round(now * 1000)
+    if path.exists():
+        try:
+            held = _history_start_ms(path)
+        except sqlite3.Error as exc:
+            print(f"cannot read the database in {args.data_dir}: {exc}; it is left as it is", file=sys.stderr)
+            return 1
+        if held is not None:
+            end_ms = min(end_ms, held)
+    end = end_ms / 1000.0
+    start = end - span_s
+    sc.check_span(start, end)
+    scenario = sc.load(args.scenario, start=start, seed=args.seed)
+    # The writer takes housekeeping settings, which nothing here uses: the app's.
+    storage = Storage(path, raw_retention_days=7, rollup_retention_days=365, max_db_mb=1024)
     written = 0
     started = time.monotonic()
     try:
@@ -500,8 +518,6 @@ def main(argv: list[str] | None = None) -> int:
         help=f"{reg.MIN_CYCLE_COUNT} to {reg.MAX_CYCLE_COUNT} (default {reg.DEFAULT_CYCLE_COUNT})",
     )
     p.add_argument("--data-dir", default="data")
-    p.add_argument("--raw-retention-days", type=_between(0.01, 3650), default=7.0)
-    p.add_argument("--max-db-mb", type=_between(16, 1_000_000), default=1024.0)
     p.set_defaults(func=cmd_backfill)
 
     p = sub.add_parser("describe", help="print a scenario fully resolved")

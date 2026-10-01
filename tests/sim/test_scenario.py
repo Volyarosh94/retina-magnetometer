@@ -77,8 +77,18 @@ class TestTimes:
             sc.parse_duration(text, "x")
 
     def test_relative_and_absolute_times(self):
-        assert sc.parse_time("+10m", START, "x") == START + 600
-        assert sc.parse_time("2026-09-30T14:00:00Z", START, "x") == 1_790_776_800.0
+        s = build(
+            {
+                **QUIET,
+                "events": [
+                    {**STEP, "at": "+10m"},
+                    {**STEP, "at": "2026-09-30T14:00:00Z"},
+                    {**STEP, "at": datetime(2026, 9, 30, 15, tzinfo=timezone.utc)},  # a YAML timestamp
+                ],
+            }
+        )
+        starts = [series.occurrence(0).start for series in s.field_model.steps]
+        assert starts == [START + 600, 1_790_776_800.0, 1_790_780_400.0]
 
     def test_repeats_expand(self):
         s = build({**QUIET, "events": [{**STEP, "at": "+1m", "every": "10m", "count": 3, "duration": "1m"}]})
