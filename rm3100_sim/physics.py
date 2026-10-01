@@ -14,20 +14,25 @@ The model is the sum of independent sources, each a pure function of time:
          + UAP passes (magnetic dipoles)          200 nT at 1 km, 1/r^3
 
 Randomness never comes from a shared generator. Every draw is a pure function
-of (seed, stream name, index), so a source can be added or removed without
-shifting any other source's numbers, and a sample at a given time has the same
-noise in every run with the same seed.
+of (seed, stream name, index), and a scenario names each event's streams after
+the event itself, so a source can be added, removed or moved without shifting
+any other source's numbers, and a sample at a given time has the same noise in
+every run with the same seed.
+
+A source that repeats is a ``Schedule`` and a way to build each occurrence
+(``Recurring``). Occurrences are built when a time near them is asked for, so
+a repeat with no end runs for as long as anything samples it.
 """
 
 from __future__ import annotations
 
-import bisect
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import cached_property, lru_cache
+from typing import Any
 
 Vec = tuple[float, float, float]
 
@@ -36,8 +41,15 @@ Vec = tuple[float, float, float]
 MU0_OVER_4PI = 1e-7
 TESLA_TO_NT = 1e9
 
-# The chip's linear range (UM16 Table 3-1). Beyond it the output saturates.
+# The chip's field measurement range, ±800 µT (UM16 Table 3-1). The table
+# defines it as the monotonic part of the output curve, and specifies
+# linearity only over ±200 µT; the model is linear up to the edge and
+# saturates there.
 SENSOR_RANGE_NT = 800_000.0
+
+# A source is left out wherever it contributes less than this: a thousandth
+# of a nanotesla, four orders of magnitude under the sensor's resolution.
+NEGLIGIBLE_NT = 1e-3
 
 
 # ── Vector helpers ───────────────────────────────────────────────────────────
@@ -104,6 +116,126 @@ def day_of_year(t: float) -> float:
     return moment.timetuple().tm_yday - 1 + (moment.hour * 3600 + moment.minute * 60 + moment.second) / 86400.0
 
 
+# ── Repeats ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """When something happens: at ``first``, then every ``every`` seconds.
+
+    ``count`` bounds the repeats; without one they never end. Occurrences are
+    numbered from 0 and worked out when asked for, never listed, so an endless
+    repeat costs nothing until a time near it is sampled.
+    """
+
+    first: float
+    every: float | None = None  # None: it happens once
+    count: int | None = None  # with ``every``; None: for ever
+
+    def time(self, k: int) -> float:
+        """When occurrence ``k`` is due."""
+        return self.first if self.every is None else self.first + k * self.every
+
+    def near(self, earliest: float, latest: float) -> range:
+        """The occurrences that may be due between ``earliest`` and ``latest``.
+
+        One to spare at each end, so that rounding in the division never loses
+        one; callers check each candidate's own time.
+        """
+        if self.every is None:
+            return range(1)
+        low = max(0, math.floor((earliest - self.first) / self.every) - 1)
+        high = math.ceil((latest - self.first) / self.every) + 1
+        if self.count is not None:
+            high = min(high, self.count - 1)
+        return range(low, max(low, high + 1))
+
+    def occurrences_between(self, after: float, until: float, *, shift: float = 0.0) -> int:
+        """How many occurrences, each moved ``shift`` seconds later, fall in
+        (after, until].
+
+        Worked out rather than counted one by one, so a dense repeat over a
+        long gap costs no more than a sparse one: the first and last indices
+        are estimated by division, then settled against the exact times, as
+        rounding can leave an estimate one out.
+        """
+        if until <= after:
+            return 0
+
+        def due(k: int) -> float:
+            return self.time(k) + shift
+
+        if self.every is None:
+            return 1 if after < due(0) <= until else 0
+        low = max(0, math.floor((after - shift - self.first) / self.every))
+        while low > 0 and due(low - 1) > after:
+            low -= 1
+        while due(low) <= after:
+            low += 1
+        high = max(-1, math.floor((until - shift - self.first) / self.every))
+        while due(high + 1) <= until:
+            high += 1
+        while high >= 0 and due(high) > until:
+            high -= 1
+        if self.count is not None:
+            high = min(high, self.count - 1)
+        return max(0, high - low + 1)
+
+    def overlap(self, span_s: float) -> int:
+        """The most occurrences in progress at one instant, if each lasts ``span_s``."""
+        if self.every is None:
+            return 1
+        overlap = math.floor(span_s / self.every) + 1
+        return overlap if self.count is None else min(overlap, self.count)
+
+
+class Recurring:
+    """A source on a schedule, built one occurrence at a time as it is needed.
+
+    ``make(k, t)`` builds occurrence ``k``, due at ``t``. Each occurrence
+    matters from ``lead_s`` before it is due until ``lag_s`` after, and is
+    not evaluated outside that span. Recently built occurrences are kept, as
+    consecutive samples keep asking for the same few.
+    """
+
+    def __init__(
+        self,
+        schedule: Schedule,
+        make: Callable[[int, float], Any],
+        *,
+        lead_s: float = 0.0,
+        lag_s: float = 0.0,
+    ):
+        self.schedule = schedule
+        self.lead_s = lead_s
+        self.lag_s = lag_s
+        self._make = make
+        # Room for everything in progress at once, several times over.
+        self._keep = 64 + 4 * self.max_overlap()
+        self._built: dict[int, Any] = {}
+
+    def max_overlap(self) -> int:
+        """The most occurrences that are in effect at one instant."""
+        return self.schedule.overlap(self.lead_s + self.lag_s)
+
+    def occurrence(self, k: int) -> Any:
+        built = self._built.get(k)
+        if built is None:
+            if len(self._built) >= self._keep:
+                self._built.clear()
+            built = self._built[k] = self._make(k, self.schedule.time(k))
+        return built
+
+    def active(self, t: float) -> list:
+        """The occurrences in effect at ``t``, oldest first."""
+        found = []
+        for k in self.schedule.near(t - self.lag_s, t + self.lead_s):
+            due = self.schedule.time(k)
+            if due - self.lead_s <= t <= due + self.lag_s:
+                found.append(self.occurrence(k))
+        return found
+
+
 # ── Main field: WMM2025 ──────────────────────────────────────────────────────
 
 
@@ -129,6 +261,12 @@ class ReferenceField:
     @property
     def vector(self) -> Vec:
         return (self.x, self.y, self.z)
+
+
+# WMM2025 is defined from 2025.0 to 2030.0. pygeomag will extrapolate the
+# secular variation beyond that, but the result is no longer the model.
+WMM_VALID_FROM = datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp()
+WMM_VALID_UNTIL = datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp()
 
 
 @lru_cache(maxsize=1)
@@ -406,6 +544,13 @@ class UapPass:
     def slant_range_m(self, t: float) -> float:
         return norm(self.position(t))
 
+    def reach_s(self) -> float:
+        """How long either side of closest approach the pass can contribute
+        more than ``NEGLIGIBLE_NT``: beyond that range even the dipole's
+        axis, where its field is strongest, is below it."""
+        reach_m = (MU0_OVER_4PI * TESLA_TO_NT * 2.0 * norm(self.moment) / NEGLIGIBLE_NT) ** (1.0 / 3.0)
+        return max(0.0, reach_m**2 - self.closest_approach_m**2 - self.altitude_m**2) ** 0.5 / self.speed_mps
+
 
 # ── Storms ───────────────────────────────────────────────────────────────────
 
@@ -431,12 +576,48 @@ class Storm:
     pulsation_nt: float = 6.0
     seed: int = 0
     n_pulsations: int = 6
+    # Names the pulsations' random streams; a scenario gives every storm, and
+    # every repeat of one, a stream of its own.
+    stream: str = "storm"
+
+    @cached_property
+    def _pulsations(self) -> tuple[tuple[float, float, float, Vec], ...]:
+        """Each pulsation's (period s, amplitude nT, phase rad, direction), drawn once."""
+        return tuple(
+            (
+                45.0 + 555.0 * uniform(self.seed, f"{self.stream}-period", k),
+                self.pulsation_nt * (0.3 + 0.7 * uniform(self.seed, f"{self.stream}-amplitude", k)),
+                2 * math.pi * uniform(self.seed, f"{self.stream}-phase", k),
+                unit_vector(self.seed, f"{self.stream}-direction", k),
+            )
+            for k in range(self.n_pulsations)
+        )
 
     def _envelope(self, age_s: float) -> float:
         main = self.main_phase_h * 3600.0
         rise = 1.0 - math.exp(-age_s / (main / 3.0))
         decay = math.exp(-max(0.0, age_s - main) / (self.recovery_h * 3600.0))
         return rise * decay
+
+    def reach_s(self) -> float:
+        """How long after its start the storm can still contribute more than
+        ``NEGLIGIBLE_NT``.
+
+        Once the main phase is over every part decays exponentially: the
+        commencement with a 90-minute time constant, the Dst field and the
+        pulsations riding on it over ``recovery_h``. Bounding each part by its
+        largest possible size (|X| + |Y| + |Z| of the Dst field is 0.95 |Dst|,
+        and a pulsation adds at most its amplitude to each axis) gives the
+        time after which the whole is negligible.
+        """
+        largest_nt = 0.95 * abs(self.dst_min_nt) + 3.0 * self.pulsation_nt * self.n_pulsations
+        reach = 0.0
+        if largest_nt > 0:
+            ratio = max(2.0 * largest_nt / NEGLIGIBLE_NT, 1.0)
+            reach = self.main_phase_h * 3600.0 + self.recovery_h * 3600.0 * math.log(ratio)
+        if self.commencement_nt:
+            reach = max(reach, 5400.0 * math.log(max(2.0 * abs(self.commencement_nt) / NEGLIGIBLE_NT, 1.0)))
+        return reach
 
     def __call__(self, t: float) -> Vec:
         age = t - self.start
@@ -448,11 +629,7 @@ class Storm:
         y = 0.08 * dst
         z = -0.15 * dst
         envelope = self._envelope(age)
-        for k in range(self.n_pulsations):
-            period = 45.0 + 555.0 * uniform(self.seed, "storm-period", k)
-            amplitude = self.pulsation_nt * (0.3 + 0.7 * uniform(self.seed, "storm-amplitude", k))
-            phase = 2 * math.pi * uniform(self.seed, "storm-phase", k)
-            direction = unit_vector(self.seed, "storm-direction", k)
+        for period, amplitude, phase, direction in self._pulsations:
             value = amplitude * envelope * math.sin(2 * math.pi * age / period + phase)
             x += value * direction[0]
             y += value * direction[1]
@@ -488,41 +665,29 @@ class Step:
 
 @dataclass
 class FieldModel:
-    """Everything outside the sensor, summed. Pure: no state changes on call.
+    """Everything outside the sensor, summed, as a function of time.
 
-    A week of repeating passes is thousands of dipoles, and a week of 1 Hz
-    samples is 600,000 evaluations, so each pass is only evaluated inside the
-    window where it contributes more than ``NEGLIGIBLE_NT`` — a thousandth of
-    a nanotesla, four orders of magnitude under the sensor's resolution.
+    Storms, steps and passes are ``Recurring`` sources, each built from one
+    scenario event. A repeat with no end runs for as long as anything samples
+    it, and a week of 1 Hz samples is 600,000 evaluations, so each occurrence
+    is only evaluated while it can contribute more than ``NEGLIGIBLE_NT``.
+    Occurrences are cached as they are built, which changes nothing a call
+    returns: the same instant always gives the same field.
     """
 
     site: Site
     crustal_offset: Vec = (0.0, 0.0, 0.0)
     sq: SqModel | None = None
-    storms: Sequence[Storm] = field(default_factory=tuple)
-    steps: Sequence[Step] = field(default_factory=tuple)
-    passes: Sequence[UapPass] = field(default_factory=tuple)
-
-    NEGLIGIBLE_NT = 1e-3
+    storms: Sequence[Recurring] = field(default_factory=tuple)
+    steps: Sequence[Recurring] = field(default_factory=tuple)
+    passes: Sequence[Recurring] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         self._main = MainField(self.site)
-        windows = []
-        for p in self.passes:
-            # Beyond this range even the dipole's axis is below NEGLIGIBLE_NT.
-            reach_m = (MU0_OVER_4PI * TESLA_TO_NT * 2.0 * norm(p.moment) / self.NEGLIGIBLE_NT) ** (1.0 / 3.0)
-            half_s = max(0.0, reach_m**2 - p.closest_approach_m**2 - p.altitude_m**2) ** 0.5 / p.speed_mps
-            windows.append((p.t_cpa - half_s, p.t_cpa + half_s, p))
-        windows.sort(key=lambda w: w[0])
-        self._pass_starts = [w[0] for w in windows]
-        self._pass_windows = windows
-        self._longest_pass_s = max((w[1] - w[0] for w in windows), default=0.0)
 
     def active_passes(self, t: float) -> list[UapPass]:
         """The passes close enough at ``t`` to matter."""
-        hi = bisect.bisect_right(self._pass_starts, t)
-        lo = bisect.bisect_left(self._pass_starts, t - self._longest_pass_s)
-        return [w[2] for w in self._pass_windows[lo:hi] if w[1] >= t]
+        return [p for series in self.passes for p in series.active(t)]
 
     def uap_field(self, t: float) -> Vec:
         return add((0.0, 0.0, 0.0), *(p.field(t) for p in self.active_passes(t)))
@@ -532,8 +697,8 @@ class FieldModel:
         parts: list[Vec] = [self.uap_field(t)]
         if self.sq is not None:
             parts.append(self.sq(t))
-        parts.extend(storm(t) for storm in self.storms)
-        parts.extend(step(t) for step in self.steps)
+        parts.extend(storm(t) for series in self.storms for storm in series.active(t))
+        parts.extend(step(t) for series in self.steps for step in series.active(t))
         return add(*parts)
 
     def __call__(self, t: float) -> Vec:

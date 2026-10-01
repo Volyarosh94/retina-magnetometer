@@ -6,8 +6,11 @@ writes POLL, polls STATUS for DRDY, burst-reads the result registers, runs the
 self test, and the simulator answers each I2C transfer the way the chip would,
 with the measurement registers filled from a physical model of the field at a
 site. Pointing the app at it is one variable, `MAGNETOMETER_BUS=tcp://host:9100`
-instead of `/dev/i2c-1`; not one line of the app knows the difference, and a
-test enforces that the app never imports this package.
+instead of `/dev/i2c-1`. The app's `tcp://` transport
+(`retina_magnetometer/rm3100/remote.py`) carries each I2C transfer here, and
+nothing above that transport knows the difference: the driver and the sampler
+see the same transfers and the same failures as on `/dev/i2c-1`. A test
+enforces that the app never imports this package.
 
 ```bash
 python -m rm3100_sim serve --scenario demo            # the chip on :9100
@@ -17,10 +20,29 @@ python -m rm3100_sim describe uap-flyby               # a scenario, fully resolv
 python -m rm3100_sim list                             # the built-in scenarios
 ```
 
-`--scenario` takes a built-in name or a YAML path; `--seed` and `--start`
-override the file. The same scenario, seed and start always give the same data:
-`generate` output is identical byte for byte, and the live server's value at a
-given instant is identical in every run.
+`serve`, `generate` and `describe` take `--scenario` (a built-in name or a
+YAML path), `--seed` and `--start`, which override the file. The same
+scenario, seed and start always give the same data: `generate` output is
+identical byte for byte, and the live server's value at a given instant is
+identical in every run.
+
+`backfill` takes `--scenario` and `--seed` and places the history itself: it
+ends where the database's history begins, or now in an empty database. That is
+the oldest sample, or the oldest minute summary if those reach back further,
+as they do on a node older than its raw retention (seven days of samples, a
+year of minutes). So it can run while the app samples, or long after, and
+never writes a sample or a summary over anything the app recorded. Where the
+history meets a minute summary it stops at that minute's start, which can
+leave up to a minute without samples at the seam. Its session is stamped
+where its history starts, so the app's own session stays the newest.
+
+Arguments are checked before anything is written: the cycle count
+must be one the app accepts (30 to 1000), the rate no faster than the chip
+can measure all three axes at that cycle count (146.6 Hz at 200), days at
+most the five years WMM2025 covers, the retention and size settings within
+the app's own limits, and durations and speeds positive (speeds up to
+100,000). A bad one is a usage error and an unreadable scenario file a
+scenario error, never a traceback or an empty file.
 
 ## The chip (`device.py`)
 
@@ -35,25 +57,63 @@ The register model implements what the manual (PNI UM16, V16.0) specifies:
   noise, and reset to 200 when the chip is power-cycled.
 - **DRDY** is cleared by reading the results and by any register write (the
   HSHAKE DRC1 and DRC0 defaults). Reading results while DRDY is low returns the
-  old values and sets NACK2; a POLL during continuous mode, or a CMM write
-  during a POLL, is ignored and sets NACK1; a write to an undefined register
-  sets NACK0.
+  old values and sets NACK2.
+- **Refused writes** are NACKed on the wire, as the manual says the chip does
+  (UM16 §4.5.1): a POLL during continuous mode or a CMM write during a POLL
+  (HSHAKE NACK1), and a write to an undefined register (NACK0), 0x0A aside
+  (below). The transfer fails with errno 121, EREMOTEIO, which is what i2c-dev
+  reports for a NACK.
 - **BIST**, armed with STE and run by the next POLL, reports per-axis pass
   bits; a scenario can kill one axis's coil.
 - **REVID** reads 0x22. Addresses other than the strapped one (0x20–0x23)
   NACK.
 
 A measurement is the scenario's field at the middle of the conversion, rotated
-into the sensor's frame, plus Gaussian noise at the datasheet level for that
-axis's cycle count, clipped at ±800 µT and quantised with PNI's gain formula.
-The noise for a conversion is a pure function of the seed, the axis and the
-time, so it does not depend on how often or in what order the app asks.
+into the sensor's frame, plus Gaussian noise, clipped at ±800 µT and quantised
+with PNI's gain formula. The datasheet's noise (Table 3-1: 30, 20 and 15 nT at
+50, 100 and 200 cycles) can only have been measured on the chip's output,
+which is in counts, so it already includes the rounding: at 200 cycles one
+count is 13.3 nT. The noise added before rounding is what is left once the
+rounding's share (one count over √12) is taken out, so the values the
+registers report have the table's spread at every cycle count; adding the
+table's figure and then rounding would overshoot it by 3 % at 200 cycles and
+15 % at 30. The noise for a conversion is a pure function of the seed, the
+axis and the time, so it does not depend on how often or in what order the app
+asks.
 
-Where the manual is silent, the model follows what the field supports and the
-[hardware checklist](../docs/hardware-verification.md) lists it. The main one:
-a pointer-only write (the first half of every register read) does not clear
-DRDY, or STATUS polling, which every maintained driver relies on, could never
-see it rise.
+Faults from the scenario act on the transfers: NACKs; a disconnect, during
+which every transfer NACKs and after which the chip is power-cycled, whether or
+not a transfer arrived while it was away; DRDY that never rises; and a
+brown-out, a power dip too short for any transfer to fail, which puts the
+registers back to their defaults (cycle counts 200, continuous mode off) and
+loses a conversion under way. Nothing on the bus shows a brown-out: only
+reading the registers back, or noticing that DRDY has stopped rising in
+continuous mode, can.
+
+Where the manual is silent, or its letter would break what works in the
+field, the model picks a reading. The one the app depends on is in the
+[hardware checklist](../docs/hardware-verification.md): DRC0 clears DRDY when
+a write's first data byte arrives, not as its register address arrives, as the
+manual's text has it (R07 §5.6.2, p.36). A pointer-only write, the first half
+of every register read, therefore leaves DRDY alone; otherwise STATUS polling,
+which every maintained driver relies on, could never see it rise.
+
+Nothing in the app depends on the rest:
+
+- In a multi-byte write, bytes before a refused one have taken effect. The
+  manual says only that the chip NACKs, and that the address increments after
+  each byte.
+- A write to a read-only register is refused like one to an undefined
+  register.
+- Register 0x0A is accepted although Table 5-1 leaves it out. HamSCI's
+  rm3100-runMag writes it as an undocumented "NOS" register, without checking
+  whether the chip acknowledged it, so the model stores the value and ignores
+  it rather than refuse software that uses it. What the chip does with it is
+  unknown.
+- Nothing clears a NACK bit but a power cycle, and NACK0 is already set in the
+  reset value the manual gives (0x1B), so only the wire shows that a write was
+  refused.
+- A cycle count of 0, which the register accepts, counts nothing and reads 0.
 
 ### The wire protocol (`server.py`)
 
@@ -67,8 +127,12 @@ One JSON object per line each way, over TCP:
 
 `write` and `read` are hex; a failure carries the errno a Linux i2c-dev adapter
 returns (121, EREMOTEIO, for a NACK), which the app's client raises as
-`OSError`. `{"op": "hello"}` names the server and scenario. It is readable with
-`nc`, on purpose.
+`OSError`. The errnos are Linux's numbers whatever the server runs on: EPROTO
+is 71, as on Linux, even on macOS, where it is 100. `{"op": "hello"}` names
+the server and scenario. It is readable with `nc`, on purpose. A request line
+longer than 4096 bytes gets a single EPROTO reply, so the replies stay in step
+with the requests, and a fault inside the model comes back as EIO (5) without
+closing the connection.
 
 ## The field (`physics.py`)
 
@@ -87,14 +151,14 @@ The sensor then sees that field through its mounting (yaw, pitch, roll from
 north/east/down), a hard-iron offset and per-axis gain errors, all set by the
 scenario.
 
-The UAP model is the one the task gives: moment 1e9 A·m², falling as 1/r³.
+A UAP is a magnetic dipole of 1e9 A·m², its field falling as 1/r³.
 Aircraft and drones are left out, their moments being far smaller. A pass is
 described by its geometry at closest approach, which is what decides what a
 magnetometer sees: horizontal distance (to the right of track), altitude
 above the sensor, speed, heading, and the dipole's direction. That direction is
 drawn once per pass from the seed unless the scenario fixes it (`along_track`,
-or a vector), and stays fixed for the pass. For speed, each pass is evaluated
-only while it contributes more than 0.001 nT.
+or a vector), and stays fixed for the pass. For speed, each pass and each
+storm is evaluated only while it can contribute more than 0.001 nT.
 
 What this model is not: the Sq fit is for about 35–40° N in North America and
 is a plausible shape elsewhere, not a prediction; storms are shaped to stress
@@ -112,7 +176,7 @@ right and is not. Every field except `site` is optional.
 name: my-scenario
 description: One line for `list`
 seed: 42                      # everything random follows from this
-start: now                    # or an ISO 8601 time: 2026-09-30T12:00:00Z
+start: now                    # or an ISO 8601 time within 2025-2029: 2026-09-30T12:00:00Z
 site:
   latitude: 34.85
   longitude: -82.39
@@ -134,8 +198,9 @@ sensor:
   dead_axis: null             # x, y or z: that coil never oscillates
 events:
   - type: uap_pass
+    id: north-run             # optional: what this event's random numbers are keyed by
     at: +5m                   # relative to start, or ISO 8601
-    every: 15m                # optional repeat; `count` bounds it (default: a week's worth)
+    every: 15m                # optional repeat; `count` bounds it (default: no end)
     closest_approach_m: 800   # horizontal, to the right of track
     altitude_m: 400           # above the sensor
     speed_mps: 120
@@ -165,10 +230,20 @@ faults:
   - type: stuck_drdy          # conversions never raise DRDY
     at: +7m
     duration: 20s
+  - type: brownout            # registers back to their defaults; no transfer fails
+    at: +9m
 ```
 
 Times are `+90s`, `+5m`, `+2h`, `+1d`, `+01:30:00` from the start, or absolute
-ISO 8601. Durations take the same relative forms.
+ISO 8601. Durations take the same relative forms. A two-part time such as
+`14:00` is refused as ambiguous (YAML would otherwise read it as the number
+840, fourteen minutes). Numbers must be finite. The start must fall within
+2025-2029, the years WMM2025 covers. Faults and steps must last longer than
+zero; `probability` belongs to `nack` alone, and a brownout takes no
+`duration`. Repeats must be at least 1 ms apart, finer than anything the chip
+or the app can tell apart, and an event or fault that repeats so often that
+more than 1,000 of its occurrences would be under way at once is refused as a
+slip.
 
 ### Built-in scenarios
 
@@ -177,7 +252,7 @@ ISO 8601. Durations take the same relative forms.
 | `quiet-day` | The baseline: WMM2025, crust, the daily variation, datasheet noise |
 | `uap-flyby` | Passes every 15 minutes at slant ranges of about 0.6, 1.5 and 3 km: well inside the sensor's reach, at its edge, and beyond it. Sensor upside down, turned 37° east of north |
 | `storm` | An intense storm (Dst −250 nT) with pulsations, from ten minutes in |
-| `faults` | Every 20 minutes: a minute of 30 % NACKs, a 30 s disconnect ending in a power cycle, 20 s of stuck DRDY |
+| `faults` | Every 20 minutes: a minute of 30 % NACKs, a 30 s disconnect ending in a power cycle, 20 s of stuck DRDY, a brown-out that resets the chip without a failed transfer |
 | `demo` | What `docker compose up` runs: UAP passes, a car parked for half an hour every two hours, a short NACK burst every half hour, the rotated mounting |
 
 ## Reproducibility
@@ -185,15 +260,38 @@ ISO 8601. Durations take the same relative forms.
 Nothing draws from a shared random generator. Every random number is a hash of
 (seed, stream name, index): the noise of each axis is keyed by the conversion
 time on a 0.1 ms grid, the daily variation's day-to-day spread by the local
-day, a pass's dipole direction by its event and repeat number, a NACK by the
-transfer count. Adding an event therefore changes nothing else's numbers, and
-the same seed gives the same field at the same instant however the app samples
-it. `generate` with the same arguments writes identical files; the tests check
-that, and that a different seed changes the noise but not the field.
+day, a pass's dipole direction and a storm's pulsations by the event's
+identity and repeat number, a NACK by the transfer count. An event's identity
+is its `id`, or else its type and its `at`, never its place in the list, so
+adding, removing or reordering events changes no other event's numbers. Two
+events that would draw from one identity (two random-direction passes at the
+same `at`, say) are refused until one of them has an `id`; giving it to the
+newcomer leaves the other's numbers as they were. Events that draw nothing
+(steps, passes with a fixed dipole, storms without pulsations) may share an
+`at` freely. The same seed gives the same
+field at the same instant however the app samples it, and `generate` with the
+same arguments writes identical files; the tests check both.
+
+A different seed redraws exactly those numbers: the sensor noise, each day's
+amplitude and timing of the daily variation, the direction of every pass whose
+dipole is random, the storms' pulsations, and which transfers a NACK burst
+fails. The main field, the crust, the average shape of the daily variation,
+each storm's Dst, the steps, every pass's geometry, timing and strength, and
+when faults happen stay as they are. The tests check both halves.
 
 ## Speed
 
 `--speed` runs scenario time faster than real time (a day in 24 minutes at
 60) without changing the chip's conversion timing, so the app's driver sees
-hardware timing while the chart shows a day's variation. For history, use
+hardware timing while the chart shows a day's variation. Events and faults
+that repeat without a `count` never run out, however long or fast the server
+runs: each occurrence is worked out when its time comes, and a run of power
+cycles while no transfer was looking is counted in one step. For history, use
 `backfill`: a week at 1 Hz takes about a minute on a laptop.
+
+The model's years are 2025.0 to 2030.0, those WMM2025 covers. A scenario must
+start inside them, and `generate` and `backfill` refuse a span that leaves
+them. `serve` runs as long as it is left to, so it logs a warning instead, once,
+when its simulated time reaches 2030.0: from there on the main field is
+extrapolated, not modelled. At `--speed 60` from today that is years away; at
+the maximum, 100,000, it is hours.

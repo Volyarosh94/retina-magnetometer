@@ -7,7 +7,13 @@ and ``python -m rm3100_sim describe <name>`` prints one fully resolved.
 Times in ``events`` and ``faults`` are relative to the scenario start
 (``+90s``, ``+5m``, ``+01:30:00``) or absolute ISO 8601 (``2026-09-30T14:00Z``).
 Durations and repeat intervals take the same relative forms. An event with
-``every`` repeats; ``count`` bounds it (default: as many as fit in a week).
+``every`` (at least 1 ms) repeats; ``count`` bounds it, and without one it
+repeats for as long as anything samples the scenario.
+
+An event's random numbers (a pass's dipole direction, a storm's pulsations)
+are keyed by the event's identity, its ``id`` or else its type and ``at``,
+never by its place in the list, so adding, removing or moving one event
+leaves every other event's numbers alone.
 
 Validation is strict and names the offending key, because a scenario that
 silently ignores a typo produces a run that looks right and is not.
@@ -29,13 +35,59 @@ from rm3100_sim.physics import Vec
 
 BUILTIN_DIR = Path(__file__).parent / "scenarios"
 
-# Repeating events with no explicit count stop after this long: a week covers
-# the longest backfill the tooling offers.
-_DEFAULT_REPEAT_HORIZON_S = 7 * 86400.0
+# More occurrences of one event or fault than this in progress at once is a
+# slip (``every: 1`` is a second, not a minute), and would make every sample
+# cost thousands of evaluations.
+MAX_OVERLAP = 1000
+
+# Repeats closer than this are finer than anything the chip or the app can
+# tell apart (three axes take 1.2 ms to convert even at 30 cycles), and far
+# closer ones would put consecutive occurrences at one floating-point instant.
+MIN_EVERY_S = 0.001
 
 
 class ScenarioError(ValueError):
     """A scenario file that cannot be simulated as written."""
+
+
+# ── YAML ─────────────────────────────────────────────────────────────────────
+
+_INT = "tag:yaml.org,2002:int"
+_FLOAT = "tag:yaml.org,2002:float"
+
+# PyYAML's YAML 1.1 number patterns without their base-60 forms.
+_PLAIN_NUMBERS = {
+    _INT: re.compile(
+        r"""^(?:[-+]?0b[0-1_]+
+            |[-+]?0[0-7_]+
+            |[-+]?(?:0|[1-9][0-9_]*)
+            |[-+]?0x[0-9a-fA-F_]+)$""",
+        re.X,
+    ),
+    _FLOAT: re.compile(
+        r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?
+            |\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
+            |[-+]?\.(?:inf|Inf|INF)
+            |\.(?:nan|NaN|NAN))$""",
+        re.X,
+    ),
+}
+
+
+class _Loader(yaml.SafeLoader):
+    """PyYAML's safe loader, minus YAML 1.1's base-60 numbers.
+
+    The safe loader reads an unquoted ``14:00`` as the integer 840, so
+    ``at: 14:00`` would quietly mean fourteen minutes after the start. Read
+    this way it stays the text it is, and the time parser can say what is
+    wrong with it.
+    """
+
+
+_Loader.yaml_implicit_resolvers = {
+    first: [(tag, _PLAIN_NUMBERS.get(tag, pattern)) for tag, pattern in resolvers]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 
 
 # ── Parsing helpers ──────────────────────────────────────────────────────────
@@ -43,6 +95,7 @@ class ScenarioError(ValueError):
 _DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 _UNIT_DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd])$")
 _CLOCK_DURATION = re.compile(r"^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$")
+_TWO_PART_CLOCK = re.compile(r"^(\d+):(\d{2})$")
 
 
 def parse_duration(value: Any, where: str) -> float:
@@ -57,10 +110,17 @@ def parse_duration(value: Any, where: str) -> float:
         text = value.strip().lstrip("+")
         unit = _UNIT_DURATION.match(text)
         clock = _CLOCK_DURATION.match(text)
+        two_part = _TWO_PART_CLOCK.match(text)
         if unit:
             seconds = float(unit.group(1)) * _DURATION_UNITS[unit.group(2)]
         elif clock:
             seconds = int(clock.group(1)) * 3600 + int(clock.group(2)) * 60 + float(clock.group(3))
+        elif two_part:
+            a, b = two_part.groups()
+            raise ScenarioError(
+                f"{where}: {value!r} could be hours and minutes or minutes and seconds; "
+                f"write {int(a):02d}:{b}:00 or 00:{int(a):02d}:{b} (or 90s, 5m, 2h, 1d)"
+            )
         else:
             raise ScenarioError(f"{where}: {value!r} is not a duration (try 90s, 5m, 2h, 1d or 01:30:00)")
     else:
@@ -70,14 +130,26 @@ def parse_duration(value: Any, where: str) -> float:
     return seconds
 
 
+def _is_instant(value: Any) -> bool:
+    return isinstance(value, datetime) or (
+        isinstance(value, str) and not value.strip().startswith("+") and ("T" in value or "-" in value)
+    )
+
+
+def _anchored(value: Any, start: float, where: str) -> tuple[float, str]:
+    """A time, and how an event's identity names it: a relative time by its
+    offset and an absolute one by its instant, so the name survives a change
+    of start either way."""
+    if _is_instant(value):
+        instant = parse_instant(value, where)
+        return instant, repr(instant)
+    offset = parse_duration(value, where)
+    return start + offset, f"+{offset!r}"
+
+
 def parse_time(value: Any, start: float, where: str) -> float:
     """An absolute epoch time from ``+offset`` (relative to ``start``) or ISO 8601."""
-    if isinstance(value, datetime):
-        moment = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return moment.timestamp()
-    if isinstance(value, str) and not value.strip().startswith("+") and ("T" in value or "-" in value):
-        return parse_instant(value, where)
-    return start + parse_duration(value, where)
+    return _anchored(value, start, where)[0]
 
 
 def parse_instant(value: Any, where: str) -> float:
@@ -94,6 +166,27 @@ def parse_instant(value: Any, where: str) -> float:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment.timestamp()
+
+
+def _instant_text(t: float) -> str:
+    try:
+        return datetime.fromtimestamp(t, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return f"{t:.0f} s from 1970"
+
+
+def check_span(first: float, last: float) -> None:
+    """Refuse a run from ``first`` to ``last`` that leaves the years WMM2025
+    covers: the main field outside them would be extrapolated, not modelled."""
+    if not physics.WMM_VALID_FROM <= first <= last <= physics.WMM_VALID_UNTIL:
+        raise ScenarioError(
+            f"{_instant_text(first)} to {_instant_text(last)} goes outside 2025.0-2030.0, the years WMM2025 "
+            "covers: the main field there would be extrapolated, not modelled"
+        )
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
 class _Section:
@@ -119,7 +212,7 @@ class _Section:
         value = self.data.get(key, default)
         if value is None:
             raise ScenarioError(f"{self.where}.{key} is required")
-        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        if not _is_number(value):
             raise ScenarioError(f"{self.where}.{key}: expected a number, got {value!r}")
         if low is not None and value < low:
             raise ScenarioError(f"{self.where}.{key} must be >= {low}, got {value}")
@@ -130,11 +223,7 @@ class _Section:
     def vector(self, key: str, default: Vec = (0.0, 0.0, 0.0)) -> Vec:
         self.used.add(key)
         value = self.data.get(key, default)
-        if (
-            not isinstance(value, list | tuple)
-            or len(value) != 3
-            or not all(isinstance(v, int | float) and not isinstance(v, bool) for v in value)
-        ):
+        if not isinstance(value, list | tuple) or len(value) != 3 or not all(_is_number(v) for v in value):
             raise ScenarioError(f"{self.where}.{key}: expected three numbers [x, y, z], got {value!r}")
         return (float(value[0]), float(value[1]), float(value[2]))
 
@@ -167,22 +256,53 @@ class SensorSpec:
 
 
 @dataclass(frozen=True)
-class Fault:
-    """An I2C-level fault for a window of time.
+class Event:
+    """One entry of ``events``: a storm, a step or a UAP pass, on a schedule.
 
-    ``nack``: each transfer fails with probability ``probability``.
-    ``disconnect``: the sensor is gone (every transfer NACKs); when it returns
-    it has been power-cycled, so its registers are back at their defaults.
+    Its random numbers are keyed by ``identity`` and the repeat number, never
+    by its place in the list.
+    """
+
+    kind: str  # uap_pass, storm or step
+    identity: str  # "id:<id>" when the event has one, otherwise "<type>@<at>"
+    series: physics.Recurring
+    random: bool = False  # draws random numbers: a random dipole direction, or a storm's pulsations
+    label: str | None = None  # the event's ``id``, if it has one
+
+
+@dataclass(frozen=True)
+class Fault:
+    """An I2C-level fault, on a schedule.
+
+    ``nack``: while it lasts, each transfer fails with probability ``probability``.
+    ``disconnect``: the sensor is gone (every transfer NACKs); it comes back
+    power-cycled, its registers at their defaults, whether or not a transfer
+    arrived while it was away.
     ``stuck_drdy``: conversions never raise DRDY.
+    ``brownout``: a power dip too short for any transfer to fail. The registers
+    return to their defaults (cycle counts 200, continuous mode off) and a
+    conversion under way is lost; nothing else shows.
     """
 
     kind: str
-    start: float
-    duration_s: float
+    schedule: physics.Schedule
+    duration_s: float = 0.0  # zero for a brownout, which is instantaneous
     probability: float = 1.0
 
     def active(self, t: float) -> bool:
-        return self.start <= t < self.start + self.duration_s
+        for k in self.schedule.near(t - self.duration_s, t):
+            begins = self.schedule.time(k)
+            if begins <= t < begins + self.duration_s:
+                return True
+        return False
+
+    def power_cycles_between(self, after: float, until: float) -> int:
+        """How many times this fault power-cycles the chip in (after, until]:
+        a disconnect as it ends, a brown-out as it happens. Counted in one
+        step however many there were, so a long idle spell costs nothing."""
+        if self.kind not in ("disconnect", "brownout"):
+            return 0
+        return self.schedule.occurrences_between(after, until, shift=self.duration_s)
 
 
 @dataclass
@@ -193,6 +313,7 @@ class Scenario:
     start: float
     field_model: physics.FieldModel
     sensor: SensorSpec
+    events: list[Event] = field(default_factory=list)
     faults: list[Fault] = field(default_factory=list)
     source: str = ""
 
@@ -217,7 +338,7 @@ def builtin_names() -> list[str]:
 
 def resolve_path(name_or_path: str) -> Path:
     candidate = Path(name_or_path)
-    if candidate.suffix in (".yaml", ".yml") and candidate.exists():
+    if candidate.suffix in (".yaml", ".yml") and candidate.is_file():
         return candidate
     builtin = BUILTIN_DIR / f"{name_or_path}.yaml"
     if builtin.exists():
@@ -233,7 +354,11 @@ def load(name_or_path: str, *, start: float | None = None, seed: int | None = No
     """
     path = resolve_path(name_or_path)
     try:
-        data = yaml.safe_load(path.read_text())
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ScenarioError(f"{path}: cannot be read: {exc}") from exc
+    try:
+        data = yaml.load(text, Loader=_Loader)  # noqa: S506 - _Loader is a SafeLoader
     except yaml.YAMLError as exc:
         raise ScenarioError(f"{path}: not valid YAML: {exc}") from exc
     scenario = from_dict(data, start=start, seed=seed)
@@ -250,13 +375,21 @@ def from_dict(data: Any, *, start: float | None = None, seed: int | None = None)
         raise ScenarioError(f"scenario.seed: expected an integer, got {file_seed!r}")
     seed_value = seed if seed is not None else file_seed
 
+    # The file's start is checked even when overridden, so that a typo in it
+    # surfaces wherever the file is used, not only where it is not overridden.
     start_value = top.get("start", "now")
+    file_start = None if start_value in (None, "now") else parse_instant(start_value, "scenario.start")
     if start is not None:
         start_epoch = start
-    elif start_value in (None, "now"):
+    elif file_start is None:
         start_epoch = datetime.now(timezone.utc).timestamp()
     else:
-        start_epoch = parse_instant(start_value, "scenario.start")
+        start_epoch = file_start
+    if not physics.WMM_VALID_FROM <= start_epoch < physics.WMM_VALID_UNTIL:
+        raise ScenarioError(
+            f"the scenario starts at {_instant_text(start_epoch)}, outside 2025.0-2030.0, the years WMM2025 "
+            "covers: the main field there would be extrapolated, not modelled"
+        )
 
     site_section = _Section(top.get("site"), "scenario.site")
     site = physics.Site(
@@ -273,34 +406,41 @@ def from_dict(data: Any, *, start: float | None = None, seed: int | None = None)
 
     sensor = _parse_sensor(top.get("sensor"))
 
-    storms: list[physics.Storm] = []
-    steps: list[physics.Step] = []
-    passes: list[physics.UapPass] = []
-    events = top.get("events", []) or []
-    if not isinstance(events, list):
+    event_list = top.get("events", []) or []
+    if not isinstance(event_list, list):
         raise ScenarioError("scenario.events: expected a list")
-    for index, raw in enumerate(events):
+    events: list[Event] = []
+    named: dict[str, str] = {}
+    drawing: dict[str, str] = {}
+    for index, raw in enumerate(event_list):
         where = f"scenario.events[{index}]"
-        for occurrence, at in enumerate(_occurrences(raw, start_epoch, where)):
-            _add_event(raw, at, where, index, occurrence, seed_value, storms, steps, passes)
+        event = _parse_event(raw, start_epoch, where, seed_value)
+        if event.label is not None:
+            if event.identity in named:
+                raise ScenarioError(f"{where}.id: {event.label!r} is already the id of {named[event.identity]}")
+            named[event.identity] = where
+        if event.random:
+            if event.identity in drawing:
+                raise ScenarioError(
+                    f"{where}: {drawing[event.identity]} is a {event.kind} at the same time, and the two would "
+                    "draw the same random numbers; give one of them an id"
+                )
+            drawing[event.identity] = where
+        events.append(event)
 
-    faults: list[Fault] = []
     fault_list = top.get("faults", []) or []
     if not isinstance(fault_list, list):
         raise ScenarioError("scenario.faults: expected a list")
-    for index, raw in enumerate(fault_list):
-        where = f"scenario.faults[{index}]"
-        for at in _occurrences(raw, start_epoch, where):
-            faults.append(_parse_fault(raw, at, where))
+    faults = [_parse_fault(raw, start_epoch, f"scenario.faults[{index}]") for index, raw in enumerate(fault_list)]
 
     top.finish()
     model = physics.FieldModel(
         site=site,
         crustal_offset=crustal,
         sq=sq,
-        storms=tuple(storms),
-        steps=tuple(steps),
-        passes=tuple(passes),
+        storms=tuple(e.series for e in events if e.kind == "storm"),
+        steps=tuple(e.series for e in events if e.kind == "step"),
+        passes=tuple(e.series for e in events if e.kind == "uap_pass"),
     )
     return Scenario(
         name=name,
@@ -309,6 +449,7 @@ def from_dict(data: Any, *, start: float | None = None, seed: int | None = None)
         start=start_epoch,
         field_model=model,
         sensor=sensor,
+        events=events,
         faults=faults,
     )
 
@@ -360,114 +501,162 @@ def _parse_sensor(raw: Any) -> SensorSpec:
     return spec
 
 
-def _occurrences(raw: Any, start: float, where: str) -> list[float]:
+def _schedule(section: _Section, start: float, where: str) -> tuple[physics.Schedule, str]:
+    """When an event or fault happens, and how its identity names its ``at``."""
+    if "at" not in section.data:
+        raise ScenarioError(f"{where}.at is required")
+    first, anchor = _anchored(section.get("at"), start, f"{where}.at")
+    if "every" not in section.data:
+        if "count" in section.data:
+            raise ScenarioError(f"{where}.count only makes sense with every")
+        return physics.Schedule(first), anchor
+    every = parse_duration(section.get("every"), f"{where}.every")
+    if every < MIN_EVERY_S:
+        raise ScenarioError(f"{where}.every must be at least {MIN_EVERY_S * 1000:g} ms, got {every:g} s")
+    count = section.get("count")
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 1):
+        raise ScenarioError(f"{where}.count must be a positive integer")
+    return physics.Schedule(first, every, count), anchor
+
+
+def _check_overlap(schedule: physics.Schedule, span_s: float, where: str) -> None:
+    overlap = schedule.overlap(span_s)
+    if overlap > MAX_OVERLAP:
+        raise ScenarioError(
+            f"{where}.every: {schedule.every:g} s is too short: each occurrence lasts {span_s:,.0f} s, "
+            f"so {overlap:,} would be in progress at once (at most {MAX_OVERLAP:,})"
+        )
+
+
+_EVENT_KINDS = ("uap_pass", "storm", "step")
+
+
+def _parse_event(raw: Any, start: float, where: str, seed: int) -> Event:
     if not isinstance(raw, dict):
         raise ScenarioError(f"{where}: expected a mapping")
-    if "at" not in raw:
-        raise ScenarioError(f"{where}.at is required")
-    first = parse_time(raw["at"], start, f"{where}.at")
-    if "every" not in raw:
-        if "count" in raw:
-            raise ScenarioError(f"{where}.count only makes sense with every")
-        return [first]
-    every = parse_duration(raw["every"], f"{where}.every")
-    if every <= 0:
-        raise ScenarioError(f"{where}.every must be longer than zero")
-    count = raw.get("count")
-    if count is None:
-        count = int(_DEFAULT_REPEAT_HORIZON_S // every) + 1
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        raise ScenarioError(f"{where}.count must be a positive integer")
-    return [first + k * every for k in range(count)]
-
-
-_EVENT_KEYS = {"type", "at", "every", "count"}
-
-
-def _add_event(
-    raw: dict,
-    at: float,
-    where: str,
-    index: int,
-    occurrence: int,
-    seed: int,
-    storms: list,
-    steps: list,
-    passes: list,
-) -> None:
     section = _Section(raw, where)
-    for key in _EVENT_KEYS:
-        section.used.add(key)
-    kind = raw.get("type")
-    if kind == "uap_pass":
-        moment_am2 = section.number("moment_am2", 1e9, low=0)
-        direction = section.get("moment_direction", "random")
-        heading = section.number("heading_deg", 90.0, low=-360, high=360)
-        if direction == "random":
-            # Fixed per pass, drawn from the scenario seed: the same pass has
-            # the same dipole in every run, different passes differ.
-            unit = physics.unit_vector(seed, f"uap-moment:{index}", occurrence)
-        elif direction == "along_track":
-            h = math.radians(heading)
-            unit = (math.cos(h), math.sin(h), 0.0)
-        elif isinstance(direction, list) and len(direction) == 3:
-            length = math.sqrt(sum(float(v) ** 2 for v in direction))
-            if length == 0:
-                raise ScenarioError(f"{where}.moment_direction must not be zero")
-            unit = (float(direction[0]) / length, float(direction[1]) / length, float(direction[2]) / length)
-        else:
-            raise ScenarioError(f"{where}.moment_direction: expected random, along_track or [n, e, d]")
-        passes.append(
-            physics.UapPass(
-                t_cpa=at,
-                closest_approach_m=section.number("closest_approach_m", low=0),
-                altitude_m=section.number("altitude_m", 300.0, low=0),
-                speed_mps=section.number("speed_mps", 100.0, low=0.1, high=10_000),
-                heading_deg=heading,
-                moment=physics.scale(unit, moment_am2),
-            )
-        )
-    elif kind == "storm":
-        storms.append(
-            physics.Storm(
-                start=at,
-                dst_min_nt=section.number("dst_min_nt", -150.0, low=-2000, high=0),
-                main_phase_h=section.number("main_phase_h", 6.0, low=0.1, high=48),
-                recovery_h=section.number("recovery_h", 12.0, low=0.1, high=240),
-                commencement_nt=section.number("commencement_nt", 25.0, low=-200, high=200),
-                pulsation_nt=section.number("pulsation_nt", 6.0, low=0, high=200),
-                seed=seed * 1000 + index,
-            )
-        )
-    elif kind == "step":
-        steps.append(
-            physics.Step(
-                start=at,
-                duration_s=parse_duration(section.get("duration"), f"{where}.duration"),
-                delta=section.vector("delta_nt"),
-                ramp_s=section.number("ramp_s", 5.0, low=0.001),
-            )
-        )
-    else:
+    schedule, anchor = _schedule(section, start, where)
+    kind = section.get("type")
+    if kind not in _EVENT_KINDS:
         raise ScenarioError(f"{where}.type must be uap_pass, storm or step, got {kind!r}")
+    label = _label(section.get("id"), f"{where}.id")
+    identity = f"id:{label}" if label is not None else f"{kind}@{anchor}"
+    if kind == "uap_pass":
+        series, random = _uap_pass(section, schedule, where, seed, identity)
+    elif kind == "storm":
+        series, random = _storm(section, schedule, seed, identity)
+    else:
+        series, random = _step(section, schedule, where), False
     section.finish()
+    _check_overlap(schedule, series.lead_s + series.lag_s, where)
+    return Event(kind=kind, identity=identity, series=series, random=random, label=label)
 
 
-_FAULT_KINDS = ("nack", "disconnect", "stuck_drdy")
+def _label(value: Any, where: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str | int) or not str(value).strip():
+        raise ScenarioError(f"{where}: expected a name, got {value!r}")
+    return str(value).strip()
 
 
-def _parse_fault(raw: dict, at: float, where: str) -> Fault:
+def _uap_pass(
+    section: _Section, schedule: physics.Schedule, where: str, seed: int, identity: str
+) -> tuple[physics.Recurring, bool]:
+    moment_am2 = section.number("moment_am2", 1e9, low=0)
+    heading = section.number("heading_deg", 90.0, low=-360, high=360)
+    geometry = {
+        "closest_approach_m": section.number("closest_approach_m", low=0),
+        "altitude_m": section.number("altitude_m", 300.0, low=0),
+        "speed_mps": section.number("speed_mps", 100.0, low=0.1, high=10_000),
+        "heading_deg": heading,
+    }
+    direction = section.get("moment_direction", "random")
+    if direction == "random":
+        # Fixed per pass, drawn from the seed and the event's identity: the
+        # same pass has the same dipole in every run, different passes differ,
+        # and other events coming and going leave it alone.
+        stream = f"uap-moment:{identity}"
+
+        def make(k: int, t: float) -> physics.UapPass:
+            moment = physics.scale(physics.unit_vector(seed, stream, k), moment_am2)
+            return physics.UapPass(t_cpa=t, moment=moment, **geometry)
+
+    else:
+        moment = physics.scale(_fixed_direction(direction, heading, f"{where}.moment_direction"), moment_am2)
+
+        def make(k: int, t: float) -> physics.UapPass:
+            return physics.UapPass(t_cpa=t, moment=moment, **geometry)
+
+    # Every occurrence has the same geometry and dipole strength, so the same reach.
+    reach = physics.UapPass(t_cpa=schedule.first, moment=(moment_am2, 0.0, 0.0), **geometry).reach_s()
+    return physics.Recurring(schedule, make, lead_s=reach, lag_s=reach), direction == "random"
+
+
+def _fixed_direction(direction: Any, heading_deg: float, where: str) -> Vec:
+    if direction == "along_track":
+        h = math.radians(heading_deg)
+        return (math.cos(h), math.sin(h), 0.0)
+    if isinstance(direction, list) and len(direction) == 3 and all(_is_number(v) for v in direction):
+        length = math.hypot(*direction)
+        if length == 0:
+            raise ScenarioError(f"{where} must not be zero")
+        return (direction[0] / length, direction[1] / length, direction[2] / length)
+    raise ScenarioError(f"{where}: expected random, along_track or [north, east, down] numbers, got {direction!r}")
+
+
+def _storm(section: _Section, schedule: physics.Schedule, seed: int, identity: str) -> tuple[physics.Recurring, bool]:
+    shape = {
+        "dst_min_nt": section.number("dst_min_nt", -150.0, low=-2000, high=0),
+        "main_phase_h": section.number("main_phase_h", 6.0, low=0.1, high=48),
+        "recovery_h": section.number("recovery_h", 12.0, low=0.1, high=240),
+        "commencement_nt": section.number("commencement_nt", 25.0, low=-200, high=200),
+        "pulsation_nt": section.number("pulsation_nt", 6.0, low=0, high=200),
+    }
+
+    def make(k: int, t: float) -> physics.Storm:
+        # Every storm, and every repeat of one, has pulsations of its own.
+        return physics.Storm(start=t, seed=seed, stream=f"storm:{identity}#{k}", **shape)
+
+    # Only the pulsations are random: a storm without them draws nothing.
+    return physics.Recurring(schedule, make, lag_s=make(0, schedule.first).reach_s()), shape["pulsation_nt"] > 0
+
+
+def _step(section: _Section, schedule: physics.Schedule, where: str) -> physics.Recurring:
+    duration = parse_duration(section.get("duration"), f"{where}.duration")
+    if duration <= 0:
+        raise ScenarioError(f"{where}.duration must be longer than zero")
+    delta = section.vector("delta_nt")
+    ramp = section.number("ramp_s", 5.0, low=0.001)
+
+    def make(k: int, t: float) -> physics.Step:
+        return physics.Step(start=t, duration_s=duration, delta=delta, ramp_s=ramp)
+
+    return physics.Recurring(schedule, make, lag_s=duration)
+
+
+_FAULT_KINDS = ("nack", "disconnect", "stuck_drdy", "brownout")
+
+
+def _parse_fault(raw: Any, start: float, where: str) -> Fault:
+    if not isinstance(raw, dict):
+        raise ScenarioError(f"{where}: expected a mapping")
     section = _Section(raw, where)
-    for key in ("type", "at", "every", "count"):
-        section.used.add(key)
-    kind = raw.get("type")
+    schedule, _anchor = _schedule(section, start, where)
+    kind = section.get("type")
     if kind not in _FAULT_KINDS:
         raise ScenarioError(f"{where}.type must be one of {', '.join(_FAULT_KINDS)}, got {kind!r}")
-    fault = Fault(
-        kind=kind,
-        start=at,
-        duration_s=parse_duration(section.get("duration"), f"{where}.duration"),
-        probability=section.number("probability", 1.0, low=0, high=1),
-    )
+    if kind == "brownout":
+        if "duration" in raw:
+            raise ScenarioError(f"{where}.duration: a brownout is instantaneous and takes no duration")
+        duration = 0.0
+    else:
+        duration = parse_duration(section.get("duration"), f"{where}.duration")
+        if duration <= 0:
+            raise ScenarioError(f"{where}.duration must be longer than zero")
+    if kind != "nack" and "probability" in raw:
+        raise ScenarioError(f"{where}.probability only applies to nack faults")
+    probability = section.number("probability", 1.0, low=0, high=1) if kind == "nack" else 1.0
     section.finish()
-    return fault
+    _check_overlap(schedule, duration, where)
+    return Fault(kind=kind, schedule=schedule, duration_s=duration, probability=probability)

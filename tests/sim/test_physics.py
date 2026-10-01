@@ -18,7 +18,7 @@ def utc(*args) -> float:
 
 
 class TestDipole:
-    def test_task_numbers_on_axis(self):
+    def test_200_nt_at_1_km_and_1_6_nt_at_5_km_on_axis(self):
         m = (1e9, 0.0, 0.0)
         assert physics.norm(physics.dipole_field_nt(m, (1000.0, 0.0, 0.0))) == pytest.approx(200.0, rel=1e-9)
         assert physics.norm(physics.dipole_field_nt(m, (5000.0, 0.0, 0.0))) == pytest.approx(1.6, rel=1e-9)
@@ -236,25 +236,153 @@ class TestDeterministicRandom:
             assert statistics.fmean(v[axis] for v in vectors) == pytest.approx(0.0, abs=0.05)
 
 
+def once(source, *, lead_s=0.0, lag_s=0.0):
+    """A source that happens once, as a scenario event with no repeat."""
+    return physics.Recurring(physics.Schedule(source_time(source)), lambda k, t: source, lead_s=lead_s, lag_s=lag_s)
+
+
+def source_time(source):
+    return source.t_cpa if isinstance(source, physics.UapPass) else source.start
+
+
 class TestFieldModel:
     def test_sum_of_sources(self):
-        passes = (
-            physics.UapPass(
-                t_cpa=SEP_30_2026 + 60,
-                closest_approach_m=300,
-                altitude_m=300,
-                speed_mps=100,
-                heading_deg=0,
-                moment=(0, 0, 1e9),
-            ),
+        p = physics.UapPass(
+            t_cpa=SEP_30_2026 + 60,
+            closest_approach_m=300,
+            altitude_m=300,
+            speed_mps=100,
+            heading_deg=0,
+            moment=(0, 0, 1e9),
         )
-        model = physics.FieldModel(site=GREENVILLE, crustal_offset=(10.0, 20.0, 30.0), sq=None, passes=passes)
+        model = physics.FieldModel(
+            site=GREENVILLE,
+            crustal_offset=(10.0, 20.0, 30.0),
+            sq=None,
+            passes=(once(p, lead_s=p.reach_s(), lag_s=p.reach_s()),),
+        )
         t = SEP_30_2026 + 60
-        expected = physics.add(physics.MainField(GREENVILLE)(t), (10.0, 20.0, 30.0), passes[0].field(t))
+        expected = physics.add(physics.MainField(GREENVILLE)(t), (10.0, 20.0, 30.0), p.field(t))
         assert model(t) == pytest.approx(expected, abs=1e-6)
-        assert model.disturbance(t) == pytest.approx(passes[0].field(t))
-        assert model.uap_field(t) == pytest.approx(passes[0].field(t))
+        assert model.disturbance(t) == pytest.approx(p.field(t))
+        assert model.uap_field(t) == pytest.approx(p.field(t))
+        assert model.uap_field(t + p.reach_s() + 1) == (0.0, 0.0, 0.0)
+
+    def test_steps_and_storms_add_while_they_last(self):
+        step = physics.Step(start=SEP_30_2026, duration_s=600.0, delta=(5.0, 0.0, 0.0), ramp_s=1.0)
+        storm = physics.Storm(start=SEP_30_2026, pulsation_nt=0.0, commencement_nt=0.0)
+        model = physics.FieldModel(
+            site=GREENVILLE, steps=(once(step, lag_s=600.0),), storms=(once(storm, lag_s=storm.reach_s()),)
+        )
+        t = SEP_30_2026 + 300
+        assert model.disturbance(t) == pytest.approx(physics.add(step(t), storm(t)))
+        later = SEP_30_2026 + storm.reach_s() + 1
+        assert model.disturbance(later) == (0.0, 0.0, 0.0)
 
     def test_total_field_is_about_50000_nt(self):
         model = physics.FieldModel(site=GREENVILLE, sq=physics.SqModel(longitude=GREENVILLE.longitude))
         assert 48_000 < physics.norm(model(SEP_30_2026 + 43_200)) < 49_200
+
+
+class TestRepeats:
+    def test_occurrence_times(self):
+        schedule = physics.Schedule(100.0, 10.0, 3)
+        assert [schedule.time(k) for k in range(3)] == [100.0, 110.0, 120.0]
+        assert physics.Schedule(100.0).time(0) == 100.0
+
+    @pytest.mark.parametrize("every", [0.1, 0.3, 1 / 3, 7.7, 600.0])
+    def test_near_never_misses_an_occurrence(self, every):
+        # Float division must not lose the occurrence sitting on either edge.
+        schedule = physics.Schedule(SEP_30_2026 + 0.1, every)
+        for k in (0, 1, 2, 999, 123_456):
+            due = schedule.time(k)
+            assert k in schedule.near(due, due)
+            assert k in schedule.near(due - every / 2, due)
+            assert k in schedule.near(due, due + every / 2)
+
+    def test_near_respects_the_first_and_the_count(self):
+        schedule = physics.Schedule(1000.0, 10.0, 5)
+        assert max(schedule.near(0.0, 10_000.0)) == 4
+        assert min(schedule.near(0.0, 10_000.0)) == 0
+        assert list(physics.Schedule(1000.0, 10.0).near(0.0, 500.0)) == []  # all before the first
+
+    def test_an_endless_schedule_reaches_any_time(self):
+        schedule = physics.Schedule(0.0, 600.0)
+        far = 10 * 365 * 86_400.0
+        assert any(schedule.time(k) == far for k in schedule.near(far, far))
+
+    @pytest.mark.parametrize("every", [0.1, 1 / 3, 0.7, 7.7, 600.0])
+    @pytest.mark.parametrize("count", [None, 1, 5, 50])
+    @pytest.mark.parametrize("shift", [0.0, 0.05, 5.0])
+    def test_counting_matches_a_walk_over_every_occurrence(self, every, count, shift):
+        schedule = physics.Schedule(SEP_30_2026 + 1 / 3, every, count)
+        reach = 120 * every + shift
+        n = count if count is not None else 140
+        due = [schedule.time(k) + shift for k in range(n)]
+        # Every occurrence and its float neighbours, on both sides of the interval.
+        edges = sorted(
+            {e for d in due[:130] for e in (d, math.nextafter(d, -math.inf), math.nextafter(d, math.inf))}
+            | {schedule.first - 10.0, schedule.first + reach}
+        )
+        for after in edges[::3]:
+            for until in edges[::4]:
+                walked = sum(1 for d in due if after < d <= until) if until > after else 0
+                assert schedule.occurrences_between(after, until, shift=shift) == walked, (after, until)
+
+    def test_overlap(self):
+        assert physics.Schedule(0.0).overlap(1e9) == 1
+        assert physics.Schedule(0.0, 10.0).overlap(95.0) == 10
+        assert physics.Schedule(0.0, 10.0, 3).overlap(95.0) == 3
+
+    def test_active_occurrences_and_their_cache(self):
+        built = []
+
+        def make(k, t):
+            built.append(k)
+            return (k, t)
+
+        series = physics.Recurring(physics.Schedule(0.0, 100.0), make, lead_s=10.0, lag_s=30.0)
+        assert series.active(5.0) == [(0, 0.0)]
+        assert series.active(95.0) == [(1, 100.0)]  # ten seconds early
+        assert series.active(125.0) == [(1, 100.0)]
+        assert series.active(130.0) == [(1, 100.0)]
+        assert series.active(131.0) == []
+        assert built == [0, 1]  # each occurrence built once
+        for k in range(1000):
+            series.occurrence(k)
+        assert len(series._built) <= series._keep  # bounded however long it runs
+
+
+class TestReach:
+    @pytest.mark.parametrize("moment", [(1e9, 0, 0), (0, 0, 1e9), (5e8, -5e8, 7e8)])
+    def test_a_pass_is_negligible_beyond_its_reach(self, moment):
+        p = physics.UapPass(
+            t_cpa=0.0, closest_approach_m=400.0, altitude_m=450.0, speed_mps=120.0, heading_deg=70.0, moment=moment
+        )
+        reach = p.reach_s()
+        assert 300 < reach < 1000
+        for t in (-reach, reach, 2 * reach):
+            assert physics.norm(p.field(t)) <= physics.NEGLIGIBLE_NT
+
+    @pytest.mark.parametrize(
+        "storm",
+        [
+            physics.Storm(start=0.0),
+            physics.Storm(start=0.0, dst_min_nt=-2000.0, pulsation_nt=200.0, recovery_h=240.0, commencement_nt=-200.0),
+            physics.Storm(start=0.0, dst_min_nt=0.0, pulsation_nt=0.0, commencement_nt=30.0),
+            physics.Storm(start=0.0, dst_min_nt=0.0, pulsation_nt=0.0, commencement_nt=0.0),
+        ],
+    )
+    def test_a_storm_is_negligible_beyond_its_reach(self, storm):
+        reach = storm.reach_s()
+        for age in (reach, reach * 1.01, reach + 3600.0):
+            assert physics.norm(storm(age)) <= physics.NEGLIGIBLE_NT
+
+    def test_a_default_storm_lasts_about_a_week(self):
+        assert 5 * 86_400 < physics.Storm(start=0.0).reach_s() < 8 * 86_400
+
+    def test_pulsations_are_drawn_once_and_follow_the_stream(self):
+        storm = physics.Storm(start=0.0, seed=4)
+        assert storm._pulsations is storm._pulsations
+        assert storm(5000.0) == physics.Storm(start=0.0, seed=4, stream="storm")(5000.0)
+        assert storm(5000.0) != physics.Storm(start=0.0, seed=4, stream="storm:other")(5000.0)

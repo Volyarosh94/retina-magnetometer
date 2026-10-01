@@ -1,9 +1,11 @@
 # The failure modes the app's health reporting exists for. Every 20 minutes:
 # a minute of flaky I2C (30 % of transfers NACK), then a sensor that drops off
 # the bus for 30 s and comes back power-cycled (cycle count reset to 200), then
-# 20 s where conversions never raise DRDY.
+# 20 s where conversions never raise DRDY, then a brown-out that resets the
+# chip without a single transfer failing (only the app's register check, or a
+# continuous-mode sample that never comes, can notice it).
 name: faults
-description: Recurring I2C NACK bursts, sensor disconnects with power-cycle, and stuck DRDY
+description: Recurring I2C NACK bursts, sensor disconnects with power-cycle, stuck DRDY and silent brown-outs
 seed: 3
 start: now
 site:
@@ -26,3 +28,6 @@ faults:
     at: +7m
     every: 20m
     duration: 20s
+  - type: brownout
+    at: +10m
+    every: 20m

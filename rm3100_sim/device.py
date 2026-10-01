@@ -11,30 +11,54 @@ so the app's driver runs against it unchanged:
 - The cycle-count registers set each axis's gain, conversion time and noise.
 - Reading the results clears DRDY; so does any register write (HSHAKE DRC1
   and DRC0, both on at reset). Reading results while DRDY is low sets NACK2
-  and returns the stale values; a POLL during continuous mode, or a CMM write
-  during a POLL, is ignored and sets NACK1; a write to an undefined register
-  sets NACK0.
+  and returns the stale values.
+- A write the chip cannot carry out is refused on the wire: the data byte is
+  NACKed, which i2c-dev reports as EREMOTEIO, and HSHAKE says why (UM16
+  §4.5.1). That is a POLL during continuous mode or a CMM write during a POLL
+  (NACK1), and a write to an undefined register (NACK0).
 - BIST, armed with STE and run by the next POLL, reports per-axis pass bits.
 - REVID reads 0x22.
 
-Where the manual is silent the model picks the reading the field supports and
-docs/hardware-verification.md lists it: a pointer-only write (the first half
-of a register read) does not clear DRDY, or STATUS polling could never see it.
+Where the manual is silent, or its letter would break what works in the field,
+the model picks a reading. The one the app relies on, which
+docs/hardware-verification.md lists: DRC0 clears DRDY when a write's first
+data byte arrives. The manual's text (R07 §5.6.2, p.36) has it clear as the
+register address arrives, but then a pointer-only write, the first half of
+every register read, would clear it too, and STATUS polling, which every
+maintained driver relies on, could never see DRDY rise.
+
+The rest nothing in the app depends on. Bytes before a refused one in the same
+write have taken effect: the manual says only that the chip NACKs, and that
+the address increments after every byte. A write to a read-only register is
+refused like one to an undefined register. Register 0x0A is the exception the
+other way: Table 5-1 leaves it out, but HamSCI's rm3100-runMag writes it as an
+undocumented "NOS" register (without checking whether the write was
+acknowledged), so the model stores it and ignores it rather than refuse
+software that uses it. Nothing clears a NACK bit but a power cycle, and NACK0
+is set in the reset value the manual gives (0x1B). A cycle count of 0, which
+the register accepts, counts nothing and reads 0.
+
+Past 2030.0 the main field is extrapolated, not modelled (WMM2025's span): the
+model logs a warning the first time simulated time gets there.
 
 Measurement values come from the scenario's field at the middle of the
-conversion, plus Gaussian noise at the datasheet level for the axis's cycle
-count, quantised to counts and saturated at the sensor's ±800 µT range. The
-noise for a conversion is a pure function of (seed, axis, time), so a replay
-with the same seed and the same sample times is bit-identical.
+conversion, plus Gaussian noise, quantised to counts and saturated at the
+sensor's ±800 µT range. The noise is sized so that what comes out of the
+registers, rounding included, has the datasheet's noise for the axis's cycle
+count. The noise for a conversion is a pure function of (seed, axis, time), so
+a replay with the same seed and the same sample times is bit-identical.
 
 Faults from the scenario are applied per transfer: NACKs, a disconnected
-sensor (which comes back power-cycled, registers at their defaults), and DRDY
-that never rises.
+sensor, DRDY that never rises, and brown-outs. A disconnect ends in a power
+cycle (registers back at their defaults) as does a brown-out, whether or not a
+transfer happened to arrive in between; the first transfer after either finds
+the chip reset.
 """
 
 from __future__ import annotations
 
 import errno
+import logging
 import math
 import threading
 import time
@@ -44,6 +68,8 @@ from dataclasses import dataclass
 from retina_magnetometer.rm3100 import registers as reg
 from rm3100_sim import physics
 from rm3100_sim.scenario import Scenario
+
+log = logging.getLogger(__name__)
 
 # Linux's "Remote I/O error", what i2c-dev returns for a NACK. Not every
 # platform's errno module defines it (macOS does not), so the Linux value.
@@ -61,12 +87,27 @@ _HSHAKE_RESET = 0x1B  # UM16 Table 5-1 (PX4 treats 0x0B as the default; see docs
 _NOISE_SLOTS_PER_S = 10_000
 
 
+def input_noise_nt(cycle_count: int, noise_scale: float = 1.0) -> float:
+    """The noise to add before quantisation, so that the output has the datasheet's.
+
+    Table 3-1's noise can only have been measured on the chip's output, which
+    is in counts, so it already includes the rounding to counts: 15 nT of
+    noise at 200 cycles, where one count is 13.3 nT. Rounding spreads a value
+    by one count over √12, so adding the full figure and then rounding would
+    come out above the table at every cycle count, by 3 % at 200 and 15 % at
+    30. The rounding's share is taken out first.
+    """
+    target = reg.noise_nt(cycle_count) * noise_scale
+    return math.sqrt(max(target * target - reg.lsb_nt(cycle_count) ** 2 / 12.0, 0.0))
+
+
 def measure_counts(scenario: Scenario, epoch: float, cycle_counts) -> tuple[int, int, int]:
     """What the chip converts at scenario time ``epoch``, in counts per axis.
 
-    The scenario's field in the sensor frame, plus datasheet noise for each
-    axis's cycle count (scaled by the scenario), clipped to the ±800 µT range,
-    then quantised with the gain for that cycle count. A dead axis reads 0.
+    The scenario's field in the sensor frame, plus noise, clipped to the
+    ±800 µT range, then quantised with the gain for each axis's cycle count;
+    once quantised, the noise is the datasheet's for that cycle count (scaled
+    by the scenario). A dead axis, or one with a cycle count of 0, reads 0.
     Shared by the register model and by ``generate``/``backfill``, so a file
     of simulated samples is exactly what the chip would have produced.
     """
@@ -74,11 +115,11 @@ def measure_counts(scenario: Scenario, epoch: float, cycle_counts) -> tuple[int,
     slot = round(epoch * _NOISE_SLOTS_PER_S)
     out = []
     for i in range(3):
-        if scenario.sensor.dead_axis == _AXES[i]:
+        cycle_count = cycle_counts[i]
+        if scenario.sensor.dead_axis == _AXES[i] or cycle_count == 0:
             out.append(0)
             continue
-        cycle_count = cycle_counts[i]
-        sigma = reg.noise_nt(cycle_count) * scenario.sensor.noise_scale
+        sigma = input_noise_nt(cycle_count, scenario.sensor.noise_scale)
         value = field[i] + sigma * physics.gauss(scenario.seed, f"noise-{_AXES[i]}", slot)
         value = max(-physics.SENSOR_RANGE_NT, min(physics.SENSOR_RANGE_NT, value))
         counts = round(value * reg.gain_lsb_per_ut(cycle_count) / 1000.0)
@@ -95,8 +136,8 @@ class SimClock:
     """
 
     def __init__(self, epoch_start: float, *, speed: float = 1.0, monotonic: Callable[[], float] = time.monotonic):
-        if speed <= 0:
-            raise ValueError("speed must be positive")
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError("speed must be a positive number")
         self._monotonic = monotonic
         self._origin = monotonic()
         self.epoch_start = epoch_start
@@ -123,6 +164,7 @@ class DeviceStats:
     measurements: int = 0
     nacks_injected: int = 0
     disconnected_transfers: int = 0
+    writes_refused: int = 0
     power_cycles: int = 0
 
 
@@ -136,7 +178,10 @@ class RM3100Model:
         self.address = scenario.sensor.address
         self.stats = DeviceStats()
         self._lock = threading.Lock()
-        self._was_disconnected = False
+        # Scenario time up to which power cycles have been applied: the chip
+        # powers up now, and each transfer applies whatever happened since.
+        self._cycled_until = clock.epoch(clock.now())
+        self._past_the_model = False
         self._power_on_reset()
 
     # ── State ────────────────────────────────────────────────────────────────
@@ -173,17 +218,17 @@ class RM3100Model:
     # ── Faults ───────────────────────────────────────────────────────────────
 
     def _check_faults(self, epoch: float) -> None:
-        disconnected = any(f.kind == "disconnect" and f.active(epoch) for f in self.scenario.faults)
-        if disconnected:
-            self._was_disconnected = True
+        # Power lost since the last transfer, to a disconnect that has ended or
+        # to a brown-out: the registers are at their defaults and anything the
+        # host set is gone, whether or not a transfer saw it happen.
+        cycles = sum(f.power_cycles_between(self._cycled_until, epoch) for f in self.scenario.faults)
+        self._cycled_until = max(self._cycled_until, epoch)
+        if cycles:
+            self.stats.power_cycles += cycles
+            self._power_on_reset()
+        if any(f.kind == "disconnect" and f.active(epoch) for f in self.scenario.faults):
             self.stats.disconnected_transfers += 1
             raise OSError(EREMOTEIO, f"no acknowledge from 0x{self.address:02X} (sensor disconnected)")
-        if self._was_disconnected:
-            # Back on the bus after being unplugged: a power cycle, so the
-            # registers are at their defaults and anything the host set is gone.
-            self._was_disconnected = False
-            self.stats.power_cycles += 1
-            self._power_on_reset()
         for fault in self.scenario.faults:
             if fault.kind == "nack" and fault.active(epoch):
                 if physics.uniform(self.scenario.seed, "nack", self.stats.transfers) < fault.probability:
@@ -232,11 +277,18 @@ class RM3100Model:
 
     # ── Register writes ──────────────────────────────────────────────────────
 
+    def _refuse(self, flag: int, why: str) -> OSError:
+        """A write the chip cannot carry out: it NACKs the data byte instead
+        of acknowledging it (UM16 §4.5.1), and sets the HSHAKE bit that says
+        why. The transfer fails as a NACK fails on i2c-dev."""
+        self.hshake |= flag
+        self.stats.writes_refused += 1
+        return OSError(EREMOTEIO, f"no acknowledge from 0x{self.address:02X} ({why})")
+
     def _write_register(self, register: int, value: int, now: float) -> None:
         if register == reg.POLL:
             if self.continuous:
-                self.hshake |= _NACK1
-                return
+                raise self._refuse(_NACK1, "POLL written during continuous mode, NACK1")
             self.poll = value
             axes = value & reg.POLL_XYZ
             if axes:
@@ -244,8 +296,7 @@ class RM3100Model:
                 self._pending = _Pending(done_at=now + self._conversion_s(axes), started_at=now, axes=axes, bist=armed)
         elif register == reg.CMM:
             if self._pending is not None:
-                self.hshake |= _NACK1
-                return
+                raise self._refuse(_NACK1, "CMM written during a single measurement, NACK1")
             self.cmm = value
             if value & reg.CMM_START and value & reg.POLL_XYZ:
                 self._continuous_since = now
@@ -260,8 +311,9 @@ class RM3100Model:
             else:
                 self.cycle_counts[axis] = (current & 0xFF00) | value
         elif register == 0x0A:
-            # NOS: undocumented by PNI, written by HamSCI's software. Stored and
-            # otherwise ignored; nothing in this app depends on it.
+            # NOS: left out of Table 5-1, but HamSCI's rm3100-runMag writes it
+            # (see the module docstring). Stored and otherwise ignored; nothing
+            # in this app depends on it.
             self.nos = value
         elif register == reg.TMRC:
             self.tmrc = value if reg.TMRC_MIN <= value <= reg.TMRC_MAX else self.tmrc
@@ -272,7 +324,7 @@ class RM3100Model:
         elif register == reg.HSHAKE:
             self.hshake = (self.hshake & (_NACK0 | _NACK1 | _NACK2)) | 0x08 | (value & (_DRC0 | _DRC1))
         else:
-            self.hshake |= _NACK0
+            raise self._refuse(_NACK0, f"write to undefined register 0x{register:02X}, NACK0")
 
     def _stop_continuous(self) -> None:
         self._continuous_since = None
@@ -317,6 +369,12 @@ class RM3100Model:
             now = self.clock.now()
             epoch = self.clock.epoch(now)
             self.stats.transfers += 1
+            if epoch >= physics.WMM_VALID_UNTIL and not self._past_the_model:
+                self._past_the_model = True
+                log.warning(
+                    "simulated time has reached 2030.0, the end of WMM2025: "
+                    "from here on the main field is extrapolated, not modelled"
+                )
             if address != self.address:
                 raise OSError(EREMOTEIO, f"no acknowledge from 0x{address:02X}")
             self._check_faults(epoch)
@@ -324,12 +382,15 @@ class RM3100Model:
             if write:
                 self.pointer = write[0]
                 data = write[1:]
-                for offset, value in enumerate(data):
-                    self._write_register(self.pointer + offset, value, now)
-                if data:
-                    if self.hshake & _DRC0:
-                        self.drdy = False
-                    self.pointer += len(data)
+                # DRC0 clears DRDY when a write's first data byte arrives,
+                # before that byte is taken or refused. The manual says as the
+                # register address arrives, but then a pointer-only write, the
+                # first half of every read, would clear it too (module docstring).
+                if data and self.hshake & _DRC0:
+                    self.drdy = False
+                for value in data:
+                    self._write_register(self.pointer, value, now)
+                    self.pointer += 1
             if not read_length:
                 return b""
             out = bytearray()

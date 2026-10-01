@@ -9,7 +9,6 @@ errno a Linux adapter would return.
 
 from __future__ import annotations
 
-import errno
 import logging
 import socket
 import socketserver
@@ -23,6 +22,13 @@ log = logging.getLogger(__name__)
 # The largest transfer a client may ask for: the whole register file twice over.
 _MAX_TRANSFER_BYTES = 256
 
+# Errnos by their Linux values, which is what an i2c-dev adapter returns and
+# what the app's client expects, whatever this server runs on: macOS, for one,
+# numbers EPROTO 100 where Linux has 71. EREMOTEIO comes from the model.
+_EPROTO = 71
+_EINVAL = 22
+_EIO = 5
+
 
 class _Handler(socketserver.StreamRequestHandler):
     server: SimulatorServer
@@ -35,11 +41,19 @@ class _Handler(socketserver.StreamRequestHandler):
             while True:
                 try:
                     line = self.rfile.readline(MAX_LINE_BYTES)
+                    oversized = len(line) == MAX_LINE_BYTES and not line.endswith(b"\n")
+                    if oversized and not self._skip_rest_of_line():
+                        break
                 except OSError:
                     break
                 if not line:
                     break
-                reply = self.server.answer(line)
+                if oversized:
+                    # One reply for the one request, however long, so the
+                    # client's next reply is the answer to its next request.
+                    reply = {"ok": False, "errno": _EPROTO, "error": f"request longer than {MAX_LINE_BYTES} bytes"}
+                else:
+                    reply = self.server.answer(line)
                 try:
                     self.wfile.write(encode(reply))
                 except OSError:
@@ -47,6 +61,16 @@ class _Handler(socketserver.StreamRequestHandler):
         finally:
             self.server.untrack(self.request)
             log.info("client disconnected: %s", peer)
+
+    def _skip_rest_of_line(self) -> bool:
+        """Read and drop the rest of an oversized line, a bounded chunk at a
+        time. False if the client closed the connection first."""
+        while True:
+            chunk = self.rfile.readline(MAX_LINE_BYTES)
+            if not chunk:
+                return False
+            if chunk.endswith(b"\n"):
+                return True
 
 
 class SimulatorServer(socketserver.ThreadingTCPServer):
@@ -87,7 +111,7 @@ class SimulatorServer(socketserver.ThreadingTCPServer):
         try:
             request = decode(line)
         except ValueError as exc:
-            return {"ok": False, "errno": errno.EPROTO, "error": f"bad request: {exc}"}
+            return {"ok": False, "errno": _EPROTO, "error": f"bad request: {exc}"}
         op = request.get("op")
         if op == "hello":
             return {
@@ -99,13 +123,13 @@ class SimulatorServer(socketserver.ThreadingTCPServer):
                 "address": self.model.address,
             }
         if op != "transfer":
-            return {"ok": False, "errno": errno.EINVAL, "error": f"unknown op {op!r}"}
+            return {"ok": False, "errno": _EINVAL, "error": f"unknown op {op!r}"}
         address = request.get("address")
         read_length = request.get("read", 0)
         try:
             write = bytes.fromhex(request.get("write", ""))
         except (TypeError, ValueError):
-            return {"ok": False, "errno": errno.EINVAL, "error": "write must be hex"}
+            return {"ok": False, "errno": _EINVAL, "error": "write must be hex"}
         if (
             isinstance(address, bool)
             or not isinstance(address, int)
@@ -115,9 +139,15 @@ class SimulatorServer(socketserver.ThreadingTCPServer):
             or not 0 <= read_length <= _MAX_TRANSFER_BYTES
             or len(write) > _MAX_TRANSFER_BYTES
         ):
-            return {"ok": False, "errno": errno.EINVAL, "error": "address must be 0..127 and lengths 0..256"}
+            return {"ok": False, "errno": _EINVAL, "error": "address must be 0..127 and lengths 0..256"}
         try:
             data = self.model.transfer(address, write, read_length)
         except OSError as exc:
-            return {"ok": False, "errno": exc.errno or errno.EIO, "error": exc.strerror or str(exc)}
+            return {"ok": False, "errno": exc.errno or _EIO, "error": exc.strerror or str(exc)}
+        except Exception as exc:
+            # A fault in the model is the simulator's bug, not the client's.
+            # The client gets an I/O error, as a bus in trouble would give it,
+            # and keeps its connection; the log gets the traceback.
+            log.exception("transfer to 0x%02X failed inside the model", address)
+            return {"ok": False, "errno": _EIO, "error": f"simulator fault: {exc!r}"}
         return {"ok": True, "read": data.hex()}
