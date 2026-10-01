@@ -10,8 +10,11 @@ readable with ``nc``:
 ``write`` and ``read`` payloads are hex. A failed transfer carries the errno a
 Linux i2c-dev adapter would have returned, and the client raises it as
 ``OSError``, so everything above the transport sees one failure model whether
-the sensor is simulated or soldered on. ``{"op": "hello"}`` answers with the
-server's name and protocol version and is only used to describe the bus.
+the sensor is simulated or soldered on. A reply the client cannot make sense
+of (bad JSON, a field of the wrong type) is ``OSError`` too, with ``EPROTO``.
+``{"op": "hello"}`` answers with the server's name, protocol version and
+scenario; it is there to check by hand (or from a test) what is listening,
+and the app itself never sends it.
 
 The server side lives in ``rm3100_sim.server``; the codec below is shared so
 the two cannot drift apart.
@@ -52,7 +55,9 @@ class RemoteI2CBus:
         self._timeout_s = timeout_s
         self._sock: socket.socket | None = None
         self._reader = None
-        # The web thread may describe the bus while the sampler is mid-transfer.
+        # The sampler thread makes the transfers, but the app's main thread
+        # closes the bus at shutdown, which can overlap a transfer if the
+        # sampler did not finish in time.
         self._lock = threading.Lock()
 
     def _connect(self) -> None:
@@ -99,9 +104,22 @@ class RemoteI2CBus:
 
     def transfer(self, address: int, write: bytes, read_length: int = 0) -> bytes:
         reply = self._roundtrip({"op": "transfer", "address": address, "write": write.hex(), "read": read_length})
-        if not reply.get("ok"):
-            raise OSError(int(reply.get("errno", errno.EIO)), str(reply.get("error", "transfer failed")))
-        data = bytes.fromhex(reply.get("read", ""))
+        try:
+            ok = reply.get("ok")
+            if not isinstance(ok, bool):
+                raise ValueError(f"'ok' is {ok!r}, not true or false")
+            if not ok:
+                code = reply.get("errno", errno.EIO)
+                # bool is an int too, and true would pass for EPERM.
+                if isinstance(code, bool) or not isinstance(code, int) or code <= 0:
+                    raise ValueError(f"'errno' is {code!r}, not an error number")
+                raise OSError(code, str(reply.get("error", "transfer failed")))
+            data = bytes.fromhex(reply.get("read", ""))
+        except (TypeError, ValueError) as exc:
+            # Whatever sent this is not speaking the protocol (another version,
+            # or a bug). Start the next transfer on a fresh connection.
+            self.close()
+            raise OSError(errno.EPROTO, f"unreadable reply from simulator: {exc}") from exc
         if len(data) != read_length:
             raise OSError(errno.EPROTO, f"asked for {read_length} bytes, simulator returned {len(data)}")
         return data

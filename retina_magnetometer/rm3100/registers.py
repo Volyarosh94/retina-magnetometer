@@ -91,9 +91,10 @@ def gain_lsb_per_ut(cycle_count: int) -> float:
 
     PNI's formula from its own sample code (the mbed RM3100BB sample and the
     Arduino quick guide): 0.3671 * CC + 1.5. It reproduces Table 3-1 to within
-    0.3 % (74.92 against 75 at the default 200) and covers the cycle counts the
-    table does not list. Real boards have been seen up to ~1.3x off this
-    (ArduPilot a0cf4e158a); that is a calibration matter, not a formula one.
+    0.8 % (the table's 20 and 38 are rounded; 74.92 against 75 at the default
+    200 is 0.1 %) and covers the cycle counts the table does not list. Real
+    boards have been seen up to ~1.3x off this (ArduPilot a0cf4e158a); that
+    is a calibration matter, not a formula one.
     """
     return 0.3671 * cycle_count + 1.5
 
@@ -113,7 +114,7 @@ def noise_nt(cycle_count: int) -> float:
 
     Table 3-1 gives 30, 20 and 15 nT at 50, 100 and 200 cycles. Between those
     points this interpolates in log-log; outside them it extends the nearest
-    segment's slope. That gives 11.3 nT at 400 and 8.5 nT at 800, which agrees
+    segment's slope. That gives 11.3 nT at 400 and 8.4 nT at 800, which agrees
     with the 8.7 nT Regoli et al. (2018, GI 7:129) measured at 800 cycles.
     """
     points = sorted((cc, row[1]) for cc, row in DATASHEET_TABLE.items())

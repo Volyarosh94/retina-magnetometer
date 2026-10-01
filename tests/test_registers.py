@@ -8,11 +8,14 @@ from retina_magnetometer.rm3100 import registers as reg
 class TestGainAndConversion:
     @pytest.mark.parametrize("cycle_count", [50, 100, 200])
     def test_pni_formula_reproduces_table_3_1(self, cycle_count):
+        # The tolerance the docstring states: 0.8 % (the table's 20 and 38 are
+        # rounded), 0.1 % at the default 200.
         table_gain = reg.DATASHEET_TABLE[cycle_count][0]
-        assert reg.gain_lsb_per_ut(cycle_count) == pytest.approx(table_gain, rel=0.015)
+        assert reg.gain_lsb_per_ut(cycle_count) == pytest.approx(table_gain, rel=0.008)
 
     def test_default_cycle_count_gain(self):
         assert reg.gain_lsb_per_ut(200) == pytest.approx(74.92)
+        assert reg.gain_lsb_per_ut(200) == pytest.approx(reg.DATASHEET_TABLE[200][0], rel=0.0011)
 
     def test_counts_to_nt_uses_the_gain(self):
         # 74.92 counts is one microtesla at 200 cycles.
@@ -32,6 +35,12 @@ class TestNoise:
         # Regoli et al. measured 8.73 nT RMS at 800 cycles inside shielding.
         assert reg.noise_nt(800) == pytest.approx(8.73, rel=0.05)
         assert 10.5 < reg.noise_nt(400) < 12.0
+
+    def test_extrapolated_values_the_docstring_and_readme_quote(self):
+        # Each doubling of the cycle count beyond 200 takes a quarter off, as
+        # from 100 to 200: 11.25 nT at 400 and 8.44 at 800.
+        assert reg.noise_nt(400) == pytest.approx(11.25)
+        assert reg.noise_nt(800) == pytest.approx(8.4375)
 
     def test_noise_falls_monotonically_with_cycle_count(self):
         values = [reg.noise_nt(cc) for cc in (30, 50, 75, 100, 150, 200, 400, 800, 1000)]

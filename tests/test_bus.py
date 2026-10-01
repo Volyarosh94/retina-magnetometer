@@ -1,12 +1,15 @@
-"""Choosing a transport, and the i2c-dev transport's framing (on a fake SMBus)."""
+"""Choosing a transport, the i2c-dev transport's framing (on a fake SMBus), and
+the TCP transport's handling of what a simulator peer sends back."""
 
 import errno
+import socket
+import threading
 
 import pytest
 
 from retina_magnetometer.rm3100 import bus as bus_module
 from retina_magnetometer.rm3100.bus import LinuxI2CBus, open_bus
-from retina_magnetometer.rm3100.remote import RemoteI2CBus
+from retina_magnetometer.rm3100.remote import RemoteI2CBus, encode
 
 
 class FakeSMBus:
@@ -87,3 +90,116 @@ def test_open_bus_tcp_does_not_connect_yet():
 def test_open_bus_rejects_the_unknown(spec):
     with pytest.raises(ValueError):
         open_bus(spec)
+
+
+class Peer:
+    """A loopback line server that answers each request with the next canned
+    reply, standing in for a simulator that speaks the protocol badly."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.connections = 0
+        self._stop = threading.Event()
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.settimeout(0.05)
+        self.port = self._listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.connections += 1
+            with conn, conn.makefile("rb") as reader:
+                for _line in reader:
+                    if not self.replies:
+                        break
+                    conn.sendall(self.replies.pop(0))
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(2)
+        self._listener.close()
+
+
+@pytest.fixture
+def peer():
+    started = []
+
+    def start(*replies):
+        server = Peer(replies)
+        bus = RemoteI2CBus("127.0.0.1", server.port, timeout_s=1.0)
+        started.append((server, bus))
+        return server, bus
+
+    yield start
+    for server, bus in started:
+        bus.close()
+        server.close()
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"ok": True, "read": None},
+        {"ok": True, "read": "zz"},
+        {"ok": True, "read": 42},
+        {"ok": False, "errno": "EIO", "error": "bus error"},
+        {"ok": False, "errno": None},
+        {"ok": False, "errno": 1.5},
+        {"ok": False, "errno": True},
+        {"ok": False, "errno": 0},
+        {"ok": "yes", "read": "00"},
+        {"read": "00"},
+    ],
+    ids=lambda reply: encode(reply).decode().strip(),
+)
+def test_a_reply_with_a_bad_field_is_a_protocol_error(peer, reply):
+    # Everything above the transport handles OSError and nothing else; a
+    # TypeError or ValueError from a peer's reply would end the sampler.
+    _, bus = peer(encode(reply))
+    with pytest.raises(OSError) as info:
+        bus.transfer(0x20, b"\x36", 1)
+    assert info.value.errno == errno.EPROTO
+    assert "simulator" in str(info.value)
+
+
+def test_after_a_bad_reply_the_next_transfer_starts_a_fresh_connection(peer):
+    server, bus = peer(encode({"ok": True, "read": None}), encode({"ok": True, "read": "22"}))
+    with pytest.raises(OSError):
+        bus.transfer(0x20, b"\x36", 1)
+    assert bus.transfer(0x20, b"\x36", 1) == b"\x22"
+    assert server.connections == 2
+
+
+def test_a_failed_transfer_carries_the_peers_errno(peer):
+    _, bus = peer(encode({"ok": False, "errno": 121, "error": "no acknowledge from 0x21"}))
+    with pytest.raises(OSError) as info:
+        bus.transfer(0x21, b"\x36", 1)
+    assert info.value.errno == 121 and "no acknowledge" in str(info.value)
+
+
+def test_a_failure_without_an_errno_is_an_io_error(peer):
+    _, bus = peer(encode({"ok": False}))
+    with pytest.raises(OSError) as info:
+        bus.transfer(0x20, b"\x36", 1)
+    assert info.value.errno == errno.EIO
+
+
+def test_a_reply_of_the_wrong_length_is_a_protocol_error(peer):
+    _, bus = peer(encode({"ok": True}), encode({"ok": True, "read": "0102"}))
+    for _ in range(2):
+        with pytest.raises(OSError) as info:
+            bus.transfer(0x20, b"\x36", 1)
+        assert info.value.errno == errno.EPROTO and "asked for 1 bytes" in str(info.value)
+
+
+def test_a_good_reply_reads_and_writes(peer):
+    _, bus = peer(encode({"ok": True, "read": "a5"}), encode({"ok": True, "read": ""}))
+    assert bus.transfer(0x20, b"\x34", 1) == b"\xa5"
+    assert bus.transfer(0x20, b"\x00\x70") == b""
