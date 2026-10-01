@@ -60,14 +60,40 @@ The choices in that entry, and why:
 - **`/dev` bind mount plus a device cgroup rule, not `devices:`.** A
   `devices: [/dev/i2c-1]` entry makes `docker compose up` fail on any node
   without that device, and today that is every node; a failed `up` fails the
-  Mender install of the whole stack. Binding `/dev` always succeeds, the rule
-  `c 89:* rmw` limits the container to I2C character devices, and a bus that
-  appears later (after the owl-os change) is picked up without recreating the
-  container: the app retries with backoff.
+  Mender install of the whole stack. Binding `/dev` always succeeds, and a bus
+  that appears later (after the owl-os change) is picked up without
+  recreating the container: the app retries with backoff. The bind shows the
+  container every device node on the host; the device cgroup decides which it
+  may open. The rule `c 89:1 rmw` adds `/dev/i2c-1` (i2c-dev is major 89 and
+  the minor is the adapter's number, so the rule changes with
+  `MAGNETOMETER_BUS`) to the devices Docker and runc always allow: null,
+  zero, full, random, urandom, tty, console, ptmx, the pts terminals and
+  `/dev/net/tun`. The cgroup governs device nodes only.
+- **Private `/dev/shm` and `/dev/mqueue`, and no console.** The bind is
+  recursive, so it also brings the filesystems the host mounts under `/dev`,
+  and Docker leaves out its own once `/dev` is bound. Without the entry's two
+  `tmpfs` mounts, the container would share the host's `/dev/shm`, where blah2
+  and retina-spectrum keep the SDRplay API's shared memory, and the host's
+  message queues: files owned by root, which is who the app runs as. Docker
+  mounts the two over the bind's, empty and private. The host's
+  `/dev/console`, which the default device rules admit and which is root's,
+  has the null device mounted over it. What the bind still brings: every other
+  host device node, which only the cgroup's allow-list opens; the host's
+  `/dev/pts`, whose terminals the cgroup admits, so that their file
+  permissions are what protect them (a root login's terminal is open to the
+  container's root); and any other filesystem the host mounts under `/dev`,
+  such as `/dev/hugepages` where the kernel has huge pages. Item 21 of
+  [hardware-verification.md](hardware-verification.md) checks all of this on
+  a node.
 - **No `HEALTHCHECK` and no crash loop.** Mender's update module waits for every
   container to be `running` and either healthy or without a health check, and
   the inventory marks a node degraded if any container is restarting. A node
-  without a sensor is a fact for the status page, not a failed deployment.
+  without a sensor is a fact for the status page, not a failed deployment, and
+  so is what the app may find at start. A data directory it cannot write is
+  reported on the page and in the log (`status.json` lives in that directory
+  too); a database it cannot read is moved aside, a new one begun, and the
+  page says so; a `config.yml` it does not understand is logged, and the page
+  shows no location. The app keeps running either way.
 - **Root in the container, with every capability dropped**, a read-only root
   filesystem and `no-new-privileges`. `/dev/i2c-1` is `root:i2c 0660` on the
   host, with a group id that varies by image, and Docker creates the data
@@ -94,6 +120,8 @@ i2cdetect -y 1                       # something at 0x20-0x23 (i2c-tools)
 docker logs retina-magnetometer      # "RM3100 at 0x20 on /dev/i2c-1 ..."
 curl -s localhost:3030/api/health | jq '.state, .sensor, .self_test'
 cat /data/retina-node/retina-magnetometer/status.json
+docker exec retina-magnetometer ls -A /dev/shm /dev/mqueue   # both empty
+docker exec retina-magnetometer ls -l /dev/console           # 1, 3: the null device
 ```
 
 Then open `http://<node>:3030`. The first power-up of a new sensor is worth the

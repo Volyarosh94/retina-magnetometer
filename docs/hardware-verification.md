@@ -17,7 +17,7 @@ had to pick, it picked what those drivers prove in the field.
 | # | Check | How | The code assumes |
 | --- | --- | --- | --- |
 | 1 | The bus exists and the chip answers | `i2cdetect -y 1` shows 0x20–0x23 | nothing; it probes all four |
-| 2 | Identity | `curl :3030/api/health` shows `revid: 0x22` | REVID 0x22. The manual gives no value; every driver that checks uses 0x22. ArduPilot does not trust it and checks the cycle-count defaults instead |
+| 2 | Identity | `curl -s localhost:3030/api/health \| jq .sensor.revid` shows `"0x22"` | REVID 0x22. The manual gives no value; every driver that checks uses 0x22. ArduPilot does not trust it and checks the cycle-count defaults instead |
 | 3 | Self test passes | `self_test.passed` in the health document | BIST as UM16 Fig 5-1: write 0x8F, POLL, wait for DRDY (up to 30 ms), read. PX4 saw DRDY stay low after BIST on fast hosts, so the app reads the result anyway after the wait |
 | 4 | Framing | samples flow with the default `repeated-start`; if the chip NACKs reads, set `MAGNETOMETER_I2C_FRAMING=stop` | a repeated start between the register pointer and the read (I2C_RDWR), as ArduPilot's Linux HAL, the kernel's regmap and Zephyr do. PNI's manual draws a STOP there (PX4 and HamSCI do that); both are proven on other hosts, neither on the Pi 5's RP1 adapter |
 | 5 | Bus speed and clock stretching | run at 100 kHz first, then `dtparam=i2c_arm_baudrate=400000` | nothing faster than 100 kHz is needed at these rates; the manual says ≤1 MHz and says nothing about clock stretching |
@@ -47,10 +47,11 @@ had to pick, it picked what those drivers prove in the field.
 
 | # | Check | How |
 | --- | --- | --- |
-| 17 | The container can open the bus with every capability dropped | the health state becomes `ok`, not `no_bus` with a permissions message. If it does not, check `ls -l /dev/i2c-1` is owned by root, and that the cgroup rule `c 89:* rmw` matches the device's major number (`ls -l` shows `89, 1`) |
+| 17 | The container can open the bus with every capability dropped | the health state becomes `ok`, not `no_bus` with a permissions message. If it does not, check `ls -l /dev/i2c-1` is owned by root, and that the cgroup rule `c 89:1 rmw` matches the device's numbers (`ls -l` shows `89, 1`) |
 | 18 | A bus that appears after start-up is picked up | with `dtparam=i2c_arm=on` set, `modprobe i2c-dev` on the running node; the state leaves `no_bus` within 30 s, with no container restart |
 | 19 | Unplugging and replugging the sensor | the state goes `degraded`, `no_sensor`, then `ok`; `reinitialisations` goes up by one and the cycle count is set again |
-| 20 | SD card writes | `iostat` or the card's wear counters over a day: one small transaction every 5 s at 1 Hz |
+| 20 | SD card writes | `iostat` or the card's wear counters over a day. At 1 Hz, every 5 s: one small database transaction (`MAGNETOMETER_FLUSH_INTERVAL_S`), and `status.json` replaced (written to a new file, then renamed over the old one). About once a minute, a transaction with the minute just completed (the roll-up looks every 30 s). Every 10 minutes, the retention delete and a checkpoint that truncates the WAL; SQLite also checkpoints whenever the WAL reaches 1,000 pages |
+| 21 | The container sees none of the host's shared memory, message queues or console | `docker exec retina-magnetometer ls -A /dev/shm /dev/mqueue` lists both directories empty, whatever `ls /dev/shm` shows on the host (blah2 and retina-spectrum keep the SDRplay API's files there); `docker exec retina-magnetometer ls -l /dev/console` shows `1, 3`, the null device, where the host's is `5, 1`. Anything else means the entry's `tmpfs:` lines or its `/dev/null:/dev/console` line are missing. `docker exec retina-magnetometer findmnt -R /dev` then lists what the bind still brings: the host's `/dev/pts` and any other filesystem the host mounts under `/dev` |
 
 Not verified here either: the IIO kernel driver route. Linux has had an
 RM3100 IIO driver since 5.0, but Raspberry Pi OS kernels do not build it (and

@@ -36,13 +36,25 @@
       # /dev, not `devices: [/dev/i2c-1]`. A `devices:` entry fails `up` on
       # any node where the bus does not exist yet (I2C is off in owl-os
       # today), and a failed `up` fails the Mender install of the whole stack.
-      # Binding /dev always succeeds; the cgroup rule below is what limits the
-      # container to I2C adapters, and the app reports a missing bus on its
-      # status page instead of refusing to start.
+      # Binding /dev always succeeds, a bus that appears later shows up in the
+      # container, and the app reports a missing bus on its status page
+      # instead of refusing to start. The bind shows the container every host
+      # device node; the device cgroup below limits which it may open, and the
+      # tmpfs entries at the end cover the host filesystems the bind brings.
       - /dev:/dev
+      # The host's console: the default device rules let a container open
+      # /dev/console, and the host's is root's, as the app is. The null
+      # device goes over it (mounted after the /dev bind, parents first).
+      - /dev/null:/dev/console
     device_cgroup_rules:
-      # Character major 89 is i2c-dev: /dev/i2c-* and nothing else.
-      - "c 89:* rmw"
+      # The device cgroup decides which device nodes the container may open.
+      # Docker and runc allow the usual pseudo-devices (null, zero, full,
+      # random, urandom, tty, console, ptmx and the pts terminals) and
+      # /dev/net/tun; this adds /dev/i2c-1 alone. i2c-dev is major 89 and the
+      # minor is the adapter's number, so it changes with MAGNETOMETER_BUS
+      # (89:* would admit every I2C adapter on the host). It governs device
+      # nodes only, not files in the filesystems mounted under /dev.
+      - "c 89:1 rmw"
     # Root inside the container owns /dev/i2c-1 (root:i2c 0660) and the data
     # directory Docker creates, without needing any capability.
     cap_drop:
@@ -52,3 +64,14 @@
     read_only: true
     tmpfs:
       - /tmp
+      # The /dev bind is recursive, so the host's mounts under /dev come with
+      # it, and Docker leaves out its own once /dev is bound. Without these
+      # two, /dev/shm would be the host's, which blah2 and retina-spectrum
+      # share for the SDRplay API, and /dev/mqueue the host's message queues:
+      # files owned by root, which is who the app runs as. Docker mounts these
+      # private, empty ones over them (parents first, so after the bind). The
+      # host's /dev/pts stays: its terminals are device nodes the cgroup admits
+      # (runc's defaults), so file permissions alone guard them, and a root
+      # login's terminal is open to the container's root.
+      - /dev/shm:size=1m
+      - /dev/mqueue:size=64k
