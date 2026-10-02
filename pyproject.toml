@@ -1,0 +1,94 @@
+[project]
+name = "retina-magnetometer"
+version = "0.1.0"
+description = "RM3100 magnetometer app for RETINA nodes, and a register-level RM3100 simulator to drive it"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    # Web UI and JSON API, the same framework as retina-gui.
+    "flask>=3.1.3",
+    # Production WSGI server. Pure Python, so the arm64 image needs no compiler.
+    "waitress>=3.0.2",
+    # Linux i2c-dev access (I2C_RDWR combined transactions).
+    "smbus2>=0.6.1",
+    # World Magnetic Model 2025, the reference field for orientation and for the
+    # simulator. Zero dependencies; ships NOAA's WMM_2025.COF unchanged.
+    "pygeomag>=1.1.0",
+    # Simulator scenario files, and the node's merged config.yml.
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit==4.6.2",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.2",
+    "vulture==2.14",
+]
+
+# An app is run, not installed: uv syncs its dependencies and never the project
+# (the org's ADR 2026-09-23-python-apps-lock-with-uv). Both packages run with
+# `python -m` from the repository root, which is also the image's WORKDIR.
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The project is never installed, so tests import it from the repo root.
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: long statistical runs; deselect with -m 'not slow'",
+]
+
+[tool.coverage.run]
+source = ["retina_magnetometer", "rm3100_sim"]
+branch = true
+
+# Shared ruff standard for offworldlabs Python repos. The keys below are checked
+# against offworldlabs/ops:ruff-shared.toml by the `ruff-config` pre-commit hook
+# — edit them there, not here. target-version is deliberately per-repo and
+# tracks this project's requires-python.
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "S",   # flake8-bandit (security)
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "E402",   # module-level import not at top — env setup before imports is intentional
+    "S101",   # assert in tests is fine
+    "S104",   # binding to 0.0.0.0 is intentional (Docker)
+    "S105",   # hardcoded password false positives on dev defaults
+    "S106",   # hardcoded password false positives
+    "S110",   # try-except-pass is used intentionally
+    "S112",   # try-except-continue is intentional in iteration
+    "S310",   # URL open audit — URLs are constructed internally
+    "S311",   # pseudo-random is fine for non-crypto uses
+    "S501",   # requests without verify — internal calls
+    "S603",   # subprocess calls are in controlled scripts
+    "S607",   # partial executable path is fine for scripts
+    "B008",   # function call in default arg — Depends() is FastAPI pattern
+    "B905",   # zip strict — not needed everywhere
+    "SIM102", # nested if — readability preference
+    "SIM105", # contextlib.suppress — try/except is more explicit
+    "SIM108", # ternary operator — readability preference
+    "SIM117", # combine with statements — readability preference
+    "UP017",  # datetime.UTC — cosmetic, timezone.utc is fine
+    "UP028",  # yield from — explicit loop is clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+"scripts/*" = ["S", "E"]

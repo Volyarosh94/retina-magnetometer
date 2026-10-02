@@ -1,0 +1,12 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+data
+docs
+tests
+tools
+.github
+*.md
+!retina_magnetometer/web/static/vendor/NOTICE.md

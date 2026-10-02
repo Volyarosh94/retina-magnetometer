@@ -10,6 +10,9 @@ htmlcov/
 build/
 dist/
 
+# Local overrides for docker-compose.yml, which Compose reads from .env
+.env
+
 # Local runtime data (the app writes its database and status file here)
 data/
 *.sqlite

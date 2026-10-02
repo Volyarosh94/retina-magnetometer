@@ -1,0 +1,24 @@
+# A quiet day at a RETINA-like site near Greenville, SC: the World Magnetic
+# Model field, a small static crustal offset, the solar-quiet daily variation
+# and datasheet noise. Nothing else. The baseline every other scenario adds to.
+name: quiet-day
+description: WMM2025 field at Greenville, SC with the quiet-day variation and datasheet noise
+seed: 1
+start: now
+site:
+  latitude: 34.85
+  longitude: -82.39
+  altitude_m: 300
+field:
+  # The WMM describes the core field only; local crust shifts it by tens to
+  # ~100 nT per component. A fixed plausible offset keeps "measured minus
+  # model" from being exactly zero, as it never is on a real roof.
+  crustal_offset_nt: [42.0, -18.0, 65.0]
+  diurnal:
+    f107: 120
+sensor:
+  address: 0x20
+  mounting:
+    yaw_deg: 0
+    pitch_deg: 0
+    roll_deg: 0

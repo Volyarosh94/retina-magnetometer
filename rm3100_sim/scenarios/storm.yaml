@@ -1,0 +1,24 @@
+# An intense geomagnetic storm (Dst minimum -250 nT) starting ten minutes in:
+# sudden commencement, a six-hour main phase with Pc4-Pc5 pulsations, and a
+# twelve-hour recovery. Everything a single magnetometer cannot tell apart
+# from a local disturbance on its own.
+name: storm
+description: Intense geomagnetic storm with pulsations over the quiet-day field
+seed: 11
+start: now
+site:
+  latitude: 34.85
+  longitude: -82.39
+  altitude_m: 300
+field:
+  crustal_offset_nt: [42.0, -18.0, 65.0]
+  diurnal:
+    f107: 160
+events:
+  - type: storm
+    at: +10m
+    dst_min_nt: -250
+    main_phase_h: 6
+    recovery_h: 12
+    commencement_nt: 30
+    pulsation_nt: 8
