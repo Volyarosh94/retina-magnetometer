@@ -51,7 +51,6 @@ change, and any of them may be overturned.
 | B4 | Aircraft and drones contribute nothing | The specified model: their moments are orders of magnitude smaller | — |
 | B5 | Table 3-1's noise (30, 20 and 15 nT at 50, 100 and 200 cycles) is the standard deviation of one reading on one axis, white and Gaussian, as the registers report it: rounding to counts included | PNI gives the figure as "Noise", with no statistic and no bandwidth, and it can only have been measured on the output, which is in counts. So the simulator adds Gaussian noise of √(σ² − LSB²/12) before rounding (σ the table's figure, LSB one count), and the rounded output has the table's spread. The fleet's magnetometers do the same. Detection range and the false-alarm calibration both scale with this reading | a scenario's `noise_scale` |
 
-<!-- NUMBERS: C6, the default threshold's false-alarm interval ("about one false alarm every 19 days across eight magnetometers") and "every pass within 1 km is found": refresh from the re-measured model and detection grid -->
 **Part C, the fleet and the server**
 
 | # | Assumption | Why | To change it |
@@ -61,7 +60,7 @@ change, and any of them may be overturned.
 | C3 | Detection runs on the server, over the whole network | The daily variation and storms are common to the network, and only the network can take them away (below) | — |
 | C4 | Readings reach the server on a push of their own, as ground truth and ADS-B already do. Nothing touches TCP 3012 or `/v1/nodes` | The server treats every TCP node as a radar node, and the `/v1/nodes` contract must not change | — |
 | C5 | Magnetometer data is for administrators only, on a polled endpoint, never on the aircraft WebSocket. Positions go through the same `public_latlon` rule as radar nodes | The socket is unauthenticated and broadcast. A magnetometer sits on a radar node's roof, and must not publish a location the radar node itself would not | — |
-| C6 | The default threshold is 5.5σ | On the measured model, that is about one false alarm every 19 days across eight magnetometers, and every pass within 1 km is found | `mag_threshold_sigma` |
+| C6 | The default threshold is 5.5σ | On the model fitted to the benchmark, that is about one false alarm every 19 days across eight magnetometers, against one every 1.5 days at 5σ, and every pass within 1 km is found | `mag_threshold_sigma` |
 | C7 | The settings behave like the existing simulation keys: they live in memory, and the state snapshot restores them. The threshold and the common-mode switch are the server's own and take effect at once; the fleet applies the rest in-process at its next poll (every 5 s) | Settings "following the style of the existing simulation settings" | — |
 | C8 | The simulator sends the truth behind each reading (the UAP field at the node) beside the reading | It is used to score events, never to find them | — |
 
@@ -265,6 +264,12 @@ The other alternatives:
 
 ## Part C: magnetometers in the simulated network
 
+retina-server's design note on the simulated magnetometers
+(`docs/design-notes/2026-09-30-simulated-magnetometers.md`) has a table of
+each Part C requirement and where it is met, and the fuller account of the
+choices below: the settings and how they join the Physics page, flybys, and
+each step of the detector with what was tried first.
+
 ### Where things run
 
 ```
@@ -312,25 +317,37 @@ Once a second, for each magnetometer:
    same second at every node, so the refresh itself is common to the network.
 2. **Noise.** Measured from the node's own residual over the last
    10 minutes: the standard deviation of first differences, outliers clipped
-   (never tighter than the sensor's own noise allows), divided by √2. It
-   starts again when the cycle count changes or the common mode is switched in
-   or out, and the node scores nothing until it has a minute of the new
-   residual.
+   (never tighter than the sensor's own noise allows), divided by √2, and
+   never below 0.3 times the datasheet figure. It starts again when the cycle
+   count changes or the common mode is switched in or out, and the node
+   scores nothing until it has a minute of the new residual. An estimate from
+   fewer than ten minutes of readings is less certain: over n readings the
+   statistic is 9·F(9, 2(n − 1)), not χ²₉, and on one minute noise alone
+   crosses what χ²₉ calls 5.5σ 23 times as often as on ten. So every
+   statistic is first mapped to the one with the same tail probability over
+   ten minutes of readings, and the false-alarm rate holds from the first
+   scored minute.
 3. **Common mode.** Each node has the per-axis median of the *other* nodes'
    deviations subtracted from it:
-   - the daily variation is 30–90 nT and a storm ~110 nT, the same everywhere
+   - the daily variation is 30–90 nT and a storm about 105 nT at the Dst
+     minimum (up to about 113 nT with the pulsations), the same everywhere
      to within a few nT across a fleet;
    - the median keeps a UAP near one node from leaking into the others;
    - leaving the node out keeps its own noise, and its own UAP, from pulling
      on its own baseline;
-   - a node that may be holding a pass (an event open, or a score already
-     well above noise) is left out of the others' medians, and so are the
-     nodes near it, because a pass is felt before it alarms.
+   - a node that may be carrying a pass (an event open, or a score of 3σ) is
+     left out of the others' medians, and so is every node within 3 km of
+     one, because a pass is felt before it alarms.
 
-   It is subtracted only while six or more magnetometers report: a median of
-   fewer lets one node's UAP into the others, so the common mode is then left
-   in. A node with too few quiet others to take a median from follows their
-   smoothed deviations, or holds its own recent common mode.
+   A node clear of every event that finds no one clear sets those scores
+   aside first; one at or beside an event, which is measuring the pass, takes
+   clear nodes only. However few the others, the median follows them, and
+   each window is scored against the extra noise a median of few carries.
+   With no one left, a node holds its own recent common mode, for three
+   minutes at most; where a hold ends, and where one clear of every event
+   begins one, no window spans the step. The common mode is subtracted only
+   while six or more magnetometers report: a median of fewer lets one node's
+   UAP into the others, so it is then left in.
 4. **Matched filter.** A dipole on a straight line produces, on every axis, a
    combination of the three Anderson functions f_n(u) = uⁿ/(1+u²)^(5/2),
    n = 0, 1, 2, of u = (t − t₀)/τ. Here t₀ is the time of closest approach
@@ -339,9 +356,10 @@ Once a second, for each magnetometer:
    removing a constant and a slope. This runs at six scales: τ = 2, 4, 8, 16,
    32 and 64 s, which at 100 m/s is 0.2 to 6.4 km. A window must lie within
    one unbroken stretch of readings: readings more than 5 s apart leave a
-   hole, and so does a restart of the noise estimate, and no window at any
-   scale spans one. Windows count readings, so a fleet running slow stretches
-   each scale a little.
+   hole, and so do a restart of the noise estimate, the fleet's clock
+   stepping back and the ends of a hold, and no window at any scale spans
+   one. Windows count readings, so a fleet running slow stretches each scale
+   a little.
 5. **Score.** Under noise alone, the captured energy over the noise variance
    is χ² with 9 degrees of freedom. Its tail probability is expressed as a
    one-sided Gaussian score in σ.
@@ -352,17 +370,22 @@ Once a second, for each magnetometer:
    - **Closing.** The event closes once its peak's scale, and every shorter
      one, has stayed under the threshold minus one for five readings, and the
      peak's window has passed. The longer scales still hold a strong pass for
-     minutes after it has gone, which is why they are left out.
+     minutes after it has gone, which is why they are left out. It also
+     closes when its node can no longer be followed: a restart, a hold past
+     its limit, a re-placement, or the fleet's clock stepping back.
    - **What follows.** No window that overlaps the event may open another.
 
    It carries:
    - the time of closest approach;
-   - the time scale τ, in seconds;
-   - the strength (the fitted signal's peak, in nT);
+   - the pass's own time scale τ, its slant range at closest approach over
+     its speed, in seconds, refined between the six search scales;
+   - the strength (the fitted signal's peak, in nT, at that τ);
    - the score;
    - a confidence;
    - how often noise alone would score as high;
-   - a range band, from the strength and the dipole model;
+   - a range band, from the strength, the dipole model and the score: a
+     strength read near the threshold has taken in the noise that helped it
+     over, and its band allows for that;
    - whether the model behind the confidence held when it opened
      (`calibrated`: the common mode subtracted, no storm, readings a second
      apart).
@@ -396,90 +419,174 @@ bank of time scales, after the network has removed what it has in common.
 
 `scripts/magnetometer_false_alarms.py` in retina-server runs the real code
 path: the simulator's readings go through the server's ingest, as the live
-route sends them, on a fake clock. Every run is seeded and reproducible.
+route sends them, each push stamped with its simulated time. Its networks are
+magnetometers on a grid about 20 km apart around Greenville, SC, at 200
+cycles, with the common mode subtracted: eight, except where other sizes are
+named. Every run is seeded and reproducible, and every threshold runs over
+the same simulated days, the default and the one below it over three times
+as many. The numbers here come from one run at its defaults, about an hour
+and three quarters on eight processes.
 
-<!-- NUMBERS: the false-alarm benchmark (node-hours per threshold, every row of the table, and the model column) must be re-measured with the current detector, which counts node-hours searched only -->
-**False alarms.** Eight magnetometers, with no UAP anywhere: WMM2025, crust,
-the daily variation and datasheet noise at 200 cycles. There were 2,109
-node-hours per threshold, over the same simulated days for every threshold.
-The model is the detector's (`false_alarm_rate`), described below.
+**False alarms.** No UAP anywhere: WMM2025, crust, the daily variation and
+datasheet noise, so every event is a false alarm. Node-hours are node-hours
+searched, as the live scorecard counts them. The model is the detector's
+(`false_alarm_rate`), described below.
 
-| Threshold | False alarms | Per node-hour | 95 % interval | Model |
-| ---: | ---: | ---: | --- | ---: |
-| 3.5σ | 2,886 | 1.37 | 1.32–1.42 | 1.37 |
-| 4.0σ | 506 | 0.240 | 0.220–0.262 | 0.243 |
-| 4.5σ | 75 | 0.036 | 0.028–0.045 | 0.033 |
-| 5.0σ | 5 | 0.0024 | 0.0008–0.0055 | 0.0034 |
-| **5.5σ** (default) | **0** | **0** | **0–0.0017** | **0.00028** |
-| 6.0σ | 0 | 0 | 0–0.0017 | 0.000017 |
+| Threshold | Node-hours | False alarms | Per node-hour | 95 % interval | Model |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 3.0σ | 3,065 | 17,455 | 5.70 | 5.61–5.78 | 5.71 |
+| 3.5σ | 3,065 | 4,163 | 1.36 | 1.32–1.40 | 1.34 |
+| 4.0σ | 3,065 | 716 | 0.234 | 0.217–0.251 | 0.238 |
+| 4.5σ | 3,065 | 107 | 0.035 | 0.029–0.042 | 0.032 |
+| 5.0σ | 9,194 | 25 | 0.0027 | 0.0018–0.0040 | 0.0034 |
+| **5.5σ** (default) | **9,194** | **1** | **0.00011** | **0.0000028–0.00061** | **0.00027** |
+| 6.0σ | 3,065 | 0 | 0 | 0–0.0012 | 0.000017 |
 
-<!-- NUMBERS: the hour-of-day test (16 further days, 3,068 node-hours, χ² = 32.2 on 23 d.o.f., p = 0.10; 2,044 against 2,035): re-run on fresh seeds rather than the calibration days, say the bins are UTC hours (or use local solar time, the clock the daily variation follows), and describe the runs as seeded runs of one date -->
-The rate does not follow the daily variation:
-
-- Binned by hour of day over 16 further simulated days (3,068 node-hours at
-  3.5σ), it shows no daily cycle (χ² = 32.2 on 23 degrees of freedom,
-  p = 0.10).
-- A daytime-against-night comparison, decided before 16 more days were run,
-  found the two rates equal (2,044 against 2,035 alarms).
-
-<!-- NUMBERS: the model's coefficient (A = 480), the free exponent (1.95) and the expected counts (2,885, 513, 69.7, 7.25, 0.58, 0.04) must be refitted to the re-measured benchmark -->
 **The model.** Noise alone crosses a threshold of z at A · z² · P(Z > z) per
-node-hour, with A = 480.
+node-hour, with A = 470.
 
 - **Why z².** The detector searches over two parameters, time and time
   scale. The rate of distinct excursions of such a search falls as z·φ(z),
   which is ≈ z²·P(Z > z), more slowly than the tail probability alone
   (Siegmund & Worsley 1995, *Ann. Statist.* 23; Worsley 2001, *Adv. Appl.
   Prob.* 33, for χ² fields).
-- **How A was fitted.** By Poisson maximum likelihood across all six
-  thresholds. The model's expected counts (2,885, 513, 69.7, 7.25, 0.58
-  and 0.04) sit inside the measured 95 % interval at every threshold. With the
-  exponent left free, the fit gives 1.95.
+- **How A was fitted.** By Poisson maximum likelihood across all the
+  thresholds at once. They share their simulated days, so their counts are
+  not independent, and A's interval comes from drawing whole seed-days
+  again. The model's expected counts (17,499, 4,105, 730, 99.1, 31.0, 2.48
+  and 0.05) sit inside the measured 95 % interval at every threshold, and
+  A's own interval is 463–477. With the exponent left free, the fit gives
+  2.03 (1.87–2.20).
 
-<!-- NUMBERS: "underpredicted the measured rate by 4–7×" for the fixed-looks model: re-check against the re-measured benchmark -->
 A simpler model, with a fixed number of independent looks per hour, was the
-first one tried. It underpredicted the measured rate by 4–7×, increasingly so
-at higher thresholds, and was dropped.
+first one tried. Fitted to the same counts, it gives 0.93 of the measured
+rate at 3σ and too little by 1.3, 1.6, 2.3 and 2.1 times at 3.5, 4, 4.5 and
+5σ, so it was dropped.
 
-<!-- NUMBERS: the 5.5σ rate (2.8 × 10⁻⁴ per node-hour), "one about every 19 days" across eight magnetometers, and the confidence at the threshold (0.9997): refresh from the refitted model -->
-**What 5.5σ means.** At 2.8 × 10⁻⁴ false alarms per node-hour, eight
-magnetometers raise one about every 19 days. An event at the threshold carries
-a confidence of 0.9997: the probability that noise alone would not have
-produced it at that node within an hour.
+**What 5.5σ means.** At 2.7 × 10⁻⁴ false alarms per node-hour (measured: 1
+in 9,194 node-hours), eight magnetometers raise one about every 19 days on
+the model; at 5σ they would raise one about every 1.5 days (measured: 25 in
+9,194 node-hours). An event at the
+threshold carries a confidence of 0.9997: the probability that noise alone
+would not have produced it at that node within an hour. What the lower
+threshold buys in reach is under **Reach**, below.
 
-<!-- NUMBERS: the storm table (198 node-hours; 0 against 313 false alarms; the intervals): the runs saw only the first ~3 h of the main phase (Dst about −116 nT, no recovery), so re-run them with full-length storms or describe them as that -->
-**A storm.** An intense storm (Dst −150 nT, with pulsations), at 5.5σ, over
-198 node-hours:
+**Other network sizes.** The model is fitted at eight magnetometers. With six
+or seven each median is of fewer others, and noisier, which the score allows
+for; with twelve, of more. At 3.5σ:
 
-| Common mode | False alarms | Per node-hour | 95 % interval |
-| --- | ---: | ---: | --- |
-| removed (default) | 0 | 0 | 0–0.019 |
-| not removed | 313 | 1.58 | 1.41–1.77 |
+| Magnetometers | Node-hours | False alarms | Per node-hour | 95 % interval | Model expects |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 6 | 1,006 | 1,402 | 1.39 | 1.32–1.47 | 1,347 |
+| 7 | 1,006 | 1,390 | 1.38 | 1.31–1.46 | 1,347 |
+| 12 | 1,149 | 1,569 | 1.37 | 1.30–1.43 | 1,539 |
 
-This is why detection runs over the network. The settings keep the switch, so
-the difference can be shown live.
+Over the same simulated days, six alarm 2.1 % more than eight, seven 1.3 %
+more, twelve 0.4 % less.
 
-<!-- NUMBERS: the detection-probability grid (every cell) must be re-run with the current detector and its truth label -->
+**No daily cycle.** Sixteen seeded runs of the same two days, 30 September
+and 1 October 2026, on seeds of their own, at 3.5σ: 6,137 node-hours and
+8,367 false alarms, binned by local solar time at the network's centre, the clock
+the simulated daily variation keeps. Three tests were fixed before any run:
+χ² over the 24 hours, the first four harmonics of the day, and daytime
+(06–18 local solar time) against night. Alarms can cluster in time, so each p
+also comes from turning every run's clock by a random amount, which keeps
+the clustering and breaks only the tie to the time of day:
+
+- χ² = 28.6 on 23 degrees of freedom (p = 0.19; 0.31 with the clocks turned);
+- the four harmonics, 11.4 on 8 degrees of freedom (p = 0.18; 0.28);
+- daytime against night, 4,157 against 4,210 alarms (p = 0.49; 0.53).
+
+**A storm.** An intense storm (Dst −150 nT, with pulsations of 45–600 s), at
+5.5σ, through its whole course: the sudden commencement, the main phase to
+the Dst minimum six hours in (about −142 nT), and 30 hours of recovery, each
+phase counted on its own. Eight storms at each size:
+
+| Magnetometers | Common mode | Node-hours | False alarms | Per node-hour | 95 % interval |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 8 | removed (default) | 2,322 | 0 | 0 | 0–0.0016 |
+| 8 | not removed | 2,322 | 2,426 | 1.04 | 1.00–1.09 |
+| 7 | removed | 2,031 | 0 | 0 | 0–0.0018 |
+| 7 | not removed | 2,031 | 2,139 | 1.05 | 1.01–1.10 |
+| 6 | removed | 1,741 | 0 | 0 | 0–0.0021 |
+| 6 | not removed | 1,741 | 1,833 | 1.05 | 1.01–1.10 |
+
+With the common mode left in, most of the false alarms come in the main
+phase and the first twelve hours of recovery: 2,368 of the 2,426 at eight
+magnetometers, and one in the eighteen hours after. With it removed there
+are none, in any phase, at any size. This is why detection runs over the
+network. The settings keep the switch, so the
+difference can be shown live.
+
 **Detection probability.** One 1e9 A·m² pass at a time, 300 m above the
-sensor, on a random heading with a random dipole direction, at 5.5σ, with 40
-passes per cell:
+sensor, on a random heading with a random dipole direction, 60 passes per
+cell, the same passes at every threshold. At 5.5σ:
 
 | Slant range at closest approach | 30 m/s | 100 m/s | 300 m/s |
 | ---: | ---: | ---: | ---: |
-| 0.5 km | 40/40 | 40/40 | 40/40 |
-| 1.0 km | 40/40 | 40/40 | 40/40 |
-| 1.5 km | 40/40 | 38/40 | 14/40 |
-| 2.0 km | 30/40 | 4/40 | 0/40 |
-| 2.5 km | 5/40 | 0/40 | 0/40 |
-| 3.0 km | 0/40 | 0/40 | 0/40 |
+| 0.5 km | 60/60 | 60/60 | 60/60 |
+| 1.0 km | 60/60 | 60/60 | 60/60 |
+| 1.5 km | 60/60 | 57/60 | 19/60 |
+| 2.0 km | 49/60 | 9/60 | 0/60 |
+| 2.5 km | 7/60 | 0/60 | 0/60 |
+| 3.0 km | 0/60 | 0/60 | 0/60 |
+| 3.5 km | 0/60 | 0/60 | 0/60 |
 
-<!-- NUMBERS: the reach (about 1.5 km, about 2 km for slow passes) and the area watched (a circle about 3 km across, about 57 km² for eight): refresh from the re-run grid -->
+**Reach.** The slant range out to which nine passes in ten are found, and one
+in two, in km:
+
+| Threshold | 30 m/s | 100 m/s | 300 m/s |
+| ---: | --- | --- | --- |
+| 5.0σ | 1.88 / 2.26 | 1.54 / 1.80 | 1.10 / 1.50 |
+| **5.5σ** (default) | **1.77 / 2.23** | **1.53 / 1.78** | **1.07 / 1.37** |
+| 6.0σ | 1.68 / 2.16 | 1.51 / 1.74 | 1.07 / 1.34 |
+
 With datasheet noise, a magnetometer is a local tripwire with a reach of about
-1.5 km, and about 2 km for slow passes. A slow pass stays in view longer, and
-the matched filter adds up that time. The field falls as 1/r³, so each
+1.5 km, about 1.8 km for slow passes and 1.1 km for fast ones. A slow pass
+stays in view longer, and the matched filter adds up that time. The field falls as 1/r³, so each
 doubling of the moment adds only 26 % to the reach. Eight magnetometers each
 watch a circle about 3 km across, about 57 km² between them. The radars watch
 tens of kilometres in every direction.
+
+**How well a detection is measured.** For the passes found at 5.5σ, the
+strength reads 1.01 times the true peak field (median; 0.91 to 1.46 for nine
+in ten), and 1.30 below 8σ, where the fit takes in the noise that helped the
+statistic over the threshold. The strength and τ are measured at the pass's
+own time scale, its slant range at closest approach over its speed, refined
+between the six scales the detector searches, and the published τ reads
+1.00 times the pass's own (median; 0.68 to 1.20 for nine in ten). The first
+version fitted the strength at the peak's scale, one of the six, and a pass
+whose τ fell between two scales read low: 0.85 times the true peak on the
+map's default flyby (600 m off and 300 m up at 120 m/s), where it now reads
+0.999 (0.943 to 1.037). The time of closest approach is 1 s from the truth
+(median), and the range band holds the true slant range for 98.6 % of them.
+The band's constants (`BAND_NEAR = (-0.056, -0.56)`,
+`BAND_FAR = (0.627, 2.53)`) are fitted by the benchmark to the passes it
+found at 3.5, 5, 5.5 and 6σ: the narrowest band that keeps 98 % of every
+score bin's passes inside each end, 98 % being the least at which a band
+fitted on half the seeds held nine passes in ten of the other half in every
+bin. It holds 99.3, 98.8, 98.6 and 98.1 % of the passes found at those
+thresholds, and far over near is 1.29 for a strong detection, 1.69 at 5.5σ
+and 2.50 at 3.5σ.
+
+**Where it is weakest.** Core placement, an option (spread is the default),
+puts magnetometers close enough for one pass to reach several, which is
+where the common mode is hardest to keep clean. In generated fleets with
+magnetometers within 3 km of one another, every pass is found at its own
+node, but about one pass in 22 raises a false alarm at another, 0.7–11 km
+from the pass's own: 57 false alarms in 1,048 passes, quiet as often as in a
+storm, and none at the pass's own node. A node counts as clear until it
+scores 3σ, but a pass is already in its readings before that, so a far
+node's median of the few clear others left can carry the pass, and a hold
+can then freeze it. Taking clear nodes only for a node at or beside an event
+also finds about one pass in a hundred fewer there (3,060 of 3,408, against
+3,092 of 3,412). Spread placement, the default, puts magnetometers 4–118 km
+apart, so no two are that close; on the benchmark's grid, about 20 km apart,
+the 1,260 detection passes raised no false alarm at another node, and the
+storms at six, seven and eight magnetometers none at all with the common
+mode removed. The next step is to take a node's readings out of the others'
+medians back to before it scored 3σ (a look-back exclusion), and to begin
+holds clean.
 
 ### On the map
 
@@ -492,10 +599,13 @@ The layer appears only on `/sim`, and only where the server runs a fleet:
   badges are DivIcons in the marker pane, because a second interactive canvas
   would swallow the map's clicks, and their class is not `node-marker`, which
   the end-to-end suite counts.
-- **The range band.** While a detection is open, the ring its strength
-  implies for the configured dipole moment.
+- **The range band.** While a detection is open, and fainter for a minute
+  after, the ring its strength and score imply for the configured dipole
+  moment.
 - **A summary card.** The live false-alarm rate per node-hour searched, with
-  its 95 % interval, how many passes were found, and the latest events.
+  its 95 % interval, how many passes were found, and the latest events; why,
+  when the noise model does not hold; and how many pushes the server has
+  refused or entries it has skipped, when it has.
 - **A panel per magnetometer.** Ten minutes of detection score against the
   threshold, of the residual field, and of the field as measured. The time
   scales it searches: all six, or which of them, and when the rest come.
@@ -514,6 +624,11 @@ The settings are a section of the Physics Layer page (`/sim/physics`):
   a note where it does not;
 - the common-mode switch;
 - a flyby form.
+
+The section has its own Apply, and joins the page's existing check for a
+config changed elsewhere: its unapplied edits count there as the page's own
+do. The design note in retina-server lists the behaviours of that check that
+predate this work and were left as they are.
 
 ## What only hardware can settle
 
@@ -632,13 +747,18 @@ detector needs from it.
   readings kept from stopping the radar fleet and counted in STATS; the
   config poll's wiring; the seed from the generator's stamp; flybys with
   ten-minute leads at up to 1000 m/s.
-  <!-- NUMBERS: retina-server's backend test count and coverage, the detector module's coverage, and the dashboard's test count: refresh once the retina-server changes are final -->
-- **retina-server.** The full backend suite (5,341 tests, 92.6 % coverage),
-  the dashboard's typecheck, lint and 1,591 tests, and pre-commit. The detector
-  module is fully covered, and its tests run the simulator's readings through
-  it: a quiet hour raises nothing, a close pass is found once with its truth,
-  a distant pass is not claimed, a storm is removed by the common mode, a gap
-  in the data is skipped. The benchmark above is the measurement.
+- **retina-server.** The backend's magnetometer test files, more than 250
+  detector tests, with the rest of the backend suite; the dashboard's
+  typecheck, lint and 1,770 tests; and pre-commit. The detector module is
+  fully covered, and its tests run the simulator's
+  readings through it: a quiet network raises nothing, and its false alarms
+  match the model behind every confidence; a close pass is found once, with
+  its truth, and measured at its best window; a distant pass, or noise beside
+  a UAP that does not move, is not claimed; a storm is removed by the common
+  mode, at six and seven magnetometers too; a pass over a cluster, across a
+  ring or over the dense core they build raises no false alarm elsewhere; a
+  hole, a restart, a hold, a clock stepping back and a fleet running slow
+  are each handled. The benchmark above is the measurement.
 - **End to end.** A local server with a fleet: a flyby requested from the
   `/sim` map, detected by the magnetometer it passed, and shown on the map.
   The screenshots are with the pull requests.
