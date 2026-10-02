@@ -64,9 +64,7 @@ jobs:
       - name: The app samples the simulated sensor
         run: |
           for _ in $(seq 60); do
-            state="$(curl -fsS localhost:3030/api/health | jq -r '.state + " " + (.samples_total|tostring)')" || true
-            echo "$state"
-            case "$state" in ok\ [1-9]*) break ;; esac
+            curl -fsS localhost:3030/api/health | jq -e '.state == "ok" and .samples_total >= 3' >/dev/null 2>&1 && break
             sleep 2
           done
           curl -fsS localhost:3030/api/health | jq -e '.state == "ok" and .samples_total >= 3 and .sensor.revid == "0x22" and .self_test.passed'
