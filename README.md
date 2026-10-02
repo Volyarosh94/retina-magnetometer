@@ -57,10 +57,8 @@ tests with coverage. CI also builds the image for arm64 and amd64, and brings
 the demo up and checks, through the app's own API, that it found the
 simulated sensor, is sampling it, and recovered the mounting.
 
-A tag `vX.Y.Z` that matches the version in `pyproject.toml` runs the same
-gates and publishes the image for both architectures, to the GitHub Container
-Registry of the account that owns the repository
-([docs/adding-to-a-retina-node.md](docs/adding-to-a-retina-node.md#where-the-image-comes-from)).
+A `vX.Y.Z` tag runs the same gates and publishes the image for arm64 and amd64
+to the GitHub Container Registry of the account that owns the repository.
 
 ## Documents
 
@@ -71,6 +69,8 @@ Registry of the account that owns the repository
 | [docs/design-note.md](docs/design-note.md) | Assumptions, design choices and the alternatives turned down, what the detector measured, what needs hardware, what a real node needs |
 | [docs/adding-to-a-retina-node.md](docs/adding-to-a-retina-node.md) | How this container joins a node's retina-node stack |
 | [docs/hardware-verification.md](docs/hardware-verification.md) | The bring-up checklist for a physical RM3100 |
+
+Screenshots of the app and of the `/sim` layer are in [`docs/screenshots`](docs/screenshots/).
 
 ## Layout
 
